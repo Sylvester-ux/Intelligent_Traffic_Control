@@ -4,6 +4,8 @@ from camera.webcam import Webcam
 from detection.vehicle_detector import VehicleDetector
 from tracking.vehicle_tracker import VehicleTracker
 from analytics.vehicle_counter import Vehicle_counter
+from analytics.congestion import CongestionAnalyzer
+from analytics.road_region import RoadRegion
 
 
 # Initializing system components
@@ -11,6 +13,13 @@ camera = Webcam()
 detector = VehicleDetector()
 tracker = VehicleTracker()
 counter = Vehicle_counter()
+congestion_analyzer = CongestionAnalyzer()
+road_region = RoadRegion([
+    (0.1, 0.3),
+    (0.9, 0.3),
+    (1.0, 0.95),
+    (0.0, 0.95)
+])
 
 if not camera.is_opened():
     print("Error: Could not open camera")
@@ -34,11 +43,19 @@ while True:
         detector.model.names
     )
 
+    # Identify objects within the road region
+    road_objects = [
+        obj for obj in frame_objects
+        if road_region.contains(obj["center"], frame.shape)
+    ]
+
     # Object counting
     counter.update(frame_objects)
+    congestion_data = congestion_analyzer.update(road_objects)
 
     # Draw YOLO annotations
     annotated_frame = results[0].plot()
+    road_region.draw(annotated_frame)
 
     # Draw movement information
     for obj in frame_objects:
@@ -102,6 +119,16 @@ while True:
         cv2.FONT_HERSHEY_SIMPLEX,
         0.7,
         (255, 255, 255),
+        2
+    )
+
+    cv2.putText(
+        annotated_frame,
+        f"Congestion: {congestion_data['congestion_level']}",
+        (10, 120),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 255, 255),
         2
     )
 
