@@ -20,6 +20,12 @@ from camera.rtsp import RtspSource
 from camera.webcam import WebcamSource
 from decision.models import WIRE_MOVEMENTS, ServingUnit
 from decision.settings import DecisionSettings, Weights
+from gateway.adapter import (
+    COMPAT_MODE,
+    MODES,
+    THREE_PHASE_MODE,
+    THREE_PHASE_UNITS,
+)
 from gateway.client import GatewayConfig
 from pipeline.camera_pipeline import DEFAULT_POLYGON, PipelineConfig
 
@@ -97,6 +103,9 @@ class AppConfig:
     logging: LoggingConfig
     detection: DetectionConfig = field(default_factory=DetectionConfig)
     display: bool = False
+    gateway_mode: str = COMPAT_MODE
+    gateway_movements: dict[str, str] = field(default_factory=dict)
+    three_phase_enabled: bool = False
 
     @property
     def camera_ids(self) -> tuple[str, ...]:
@@ -177,10 +186,10 @@ def build_config(raw: Mapping[str, Any], *, base_dir: Optional[Path] = None) -> 
     _validate_units(units, set(approach_owners))
     decision = _decision_settings(decision_raw)
 
-    gateway_raw = raw.get("gateway") or {}
-    if not isinstance(gateway_raw, dict):
-        raise ConfigError("'gateway' must be a mapping")
-    gateway = _build(GatewayConfig, gateway_raw, "gateway")
+    gateway_data, gateway_mode, three_phase_enabled, gateway_movements = (
+        _gateway_options(raw.get("gateway"), units)
+    )
+    gateway = _build(GatewayConfig, gateway_data, "gateway")
 
     health_raw = raw.get("health") or {}
     health = _build(HealthConfig, health_raw, "health")
@@ -202,6 +211,9 @@ def build_config(raw: Mapping[str, Any], *, base_dir: Optional[Path] = None) -> 
         logging=logging_config,
         detection=detection,
         display=display,
+        gateway_mode=gateway_mode,
+        gateway_movements=gateway_movements,
+        three_phase_enabled=three_phase_enabled,
     )
 
 
@@ -370,14 +382,96 @@ def _validate_units(
             + ", ".join(orphaned)
         )
 
-    # This build speaks the current two-phase protocol: the unit id is the
-    # wire movement until the protocol adapter lands.
-    for unit in units:
-        if unit.id not in WIRE_MOVEMENTS:
+
+def _gateway_options(
+    raw: Any, units: tuple[ServingUnit, ...]
+) -> tuple[dict[str, Any], str, bool, dict[str, str]]:
+    """Split ``gateway`` into client settings, mode and unit->movement map."""
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, Mapping):
+        raise ConfigError("'gateway' must be a mapping")
+    data = dict(raw)
+
+    mode = str(data.pop("mode", COMPAT_MODE))
+    if mode not in MODES:
+        raise ConfigError(
+            f"gateway.mode must be one of {MODES}, got {mode!r}"
+        )
+
+    three_raw = data.pop("three_phase", None) or {}
+    if not isinstance(three_raw, Mapping):
+        raise ConfigError("gateway.three_phase must be a mapping")
+    unknown = set(three_raw) - {"enabled", "movements"}
+    if unknown:
+        raise ConfigError(
+            f"unknown keys in 'gateway.three_phase': {sorted(unknown)}"
+        )
+    enabled = bool(three_raw.get("enabled", False))
+    movements_raw = three_raw.get("movements") or {}
+    if not isinstance(movements_raw, Mapping):
+        raise ConfigError("gateway.three_phase.movements must be a mapping")
+
+    unit_ids = [unit.id for unit in units]
+
+    if mode == COMPAT_MODE:
+        if enabled:
             raise ConfigError(
-                f"serving unit {unit.id!r} is not a wire movement; this build "
-                f"supports the two-phase layout {WIRE_MOVEMENTS}"
+                "gateway.three_phase.enabled is true but gateway.mode is "
+                "'compat_two_phase'; choose gateway.mode: three_phase"
             )
+        unsupported = [unit_id for unit_id in unit_ids if unit_id not in WIRE_MOVEMENTS]
+        if unsupported:
+            raise ConfigError(
+                f"compat_two_phase units must be {WIRE_MOVEMENTS}; got "
+                f"{unsupported}. Merge approaches into a SECONDARY unit or set "
+                "gateway.mode: three_phase (needs new firmware)"
+            )
+        movements = {unit_id: unit_id for unit_id in unit_ids}
+        return data, mode, False, movements
+
+    # -- three_phase: disabled by default and needs explicit names ---------
+    if not enabled:
+        raise ConfigError(
+            "gateway.mode is 'three_phase' but gateway.three_phase.enabled is "
+            "false. Three-phase control needs firmware support that does not "
+            "exist yet; the current gateway only accepts MAIN and SECONDARY"
+        )
+    if len(unit_ids) != len(THREE_PHASE_UNITS) or set(unit_ids) != set(
+        THREE_PHASE_UNITS
+    ):
+        raise ConfigError(
+            f"three_phase mode requires exactly the units {THREE_PHASE_UNITS}, "
+            f"got {unit_ids}"
+        )
+    missing = [unit_id for unit_id in THREE_PHASE_UNITS if unit_id not in movements_raw]
+    if missing:
+        raise ConfigError(
+            "gateway.three_phase.movements must explicitly name every unit; "
+            f"missing {missing}. Proposed names are SECONDARY_A/SECONDARY_B, "
+            "but nothing accepts them yet"
+        )
+    extra = set(movements_raw) - set(THREE_PHASE_UNITS)
+    if extra:
+        raise ConfigError(
+            f"gateway.three_phase.movements has unknown units: {sorted(extra)}"
+        )
+
+    movements: dict[str, str] = {}
+    for unit_id in THREE_PHASE_UNITS:
+        value = movements_raw[unit_id]
+        if not isinstance(value, str) or not value:
+            raise ConfigError(
+                f"gateway.three_phase.movements[{unit_id!r}] must be a non-empty "
+                "string"
+            )
+        movements[unit_id] = value
+    if len(set(movements.values())) != len(movements):
+        raise ConfigError(
+            "gateway.three_phase.movements values must be unique, got "
+            f"{movements}"
+        )
+    return data, mode, True, movements
 
 
 def _decision_settings(raw: Mapping[str, Any]) -> DecisionSettings:

@@ -97,9 +97,9 @@ def test_two_cameras_cannot_share_an_approach():
         build_config(raw)
 
 
-def test_serving_unit_id_must_be_a_wire_movement_in_compat_layout():
+def test_compat_mode_requires_the_firmware_unit_names():
     raw = _raw(decision={"units": _units(("NORTH", ("MAIN",)))})
-    with pytest.raises(ConfigError, match="not a wire movement"):
+    with pytest.raises(ConfigError, match="compat_two_phase units"):
         build_config(raw)
 
 
@@ -206,6 +206,111 @@ def test_decision_units_must_be_a_non_empty_list():
         build_config(_raw(decision={"units": []}))
     with pytest.raises(ConfigError, match="non-empty list"):
         build_config({"cameras": [_camera()]})
+
+
+THREE_PHASE_UNITS = _units(
+    ("MAIN", ("MAIN",)),
+    ("SEC_A", ("SEC_A",)),
+    ("SEC_B", ("SEC_B",)),
+)
+THREE_PHASE_MOVEMENTS = {
+    "MAIN": "MAIN",
+    "SEC_A": "SECONDARY_A",
+    "SEC_B": "SECONDARY_B",
+}
+
+
+def _three_phase_cameras() -> list[dict]:
+    return [
+        _camera(),
+        _camera(id="cam_sec_a", approach="SEC_A"),
+        _camera(id="cam_sec_b", approach="SEC_B"),
+    ]
+
+
+def _three_phase_raw(**gateway) -> dict:
+    gateway.setdefault("mode", "three_phase")
+    gateway.setdefault(
+        "three_phase",
+        {"enabled": True, "movements": dict(THREE_PHASE_MOVEMENTS)},
+    )
+    return {
+        "cameras": _three_phase_cameras(),
+        "decision": {"units": THREE_PHASE_UNITS},
+        "gateway": gateway,
+    }
+
+
+def test_three_phase_layout_loads_when_explicitly_enabled():
+    config = build_config(_three_phase_raw())
+
+    assert config.gateway_mode == "three_phase"
+    assert config.three_phase_enabled is True
+    assert config.gateway_movements == THREE_PHASE_MOVEMENTS
+    assert [unit.id for unit in config.units] == ["MAIN", "SEC_A", "SEC_B"]
+
+
+def test_three_phase_is_refused_while_disabled():
+    raw = _three_phase_raw()
+    raw["gateway"]["three_phase"]["enabled"] = False
+
+    with pytest.raises(ConfigError, match="enabled is false"):
+        build_config(raw)
+
+
+def test_three_phase_needs_explicit_movement_names():
+    raw = _three_phase_raw()
+    del raw["gateway"]["three_phase"]["movements"]["SEC_B"]
+
+    with pytest.raises(ConfigError, match="explicitly name every unit"):
+        build_config(raw)
+
+
+def test_three_units_are_rejected_in_compat_mode():
+    raw = _three_phase_raw(mode="compat_two_phase")
+    raw["gateway"].pop("three_phase")
+
+    with pytest.raises(ConfigError, match="compat_two_phase units"):
+        build_config(raw)
+
+
+def test_enabling_three_phase_while_in_compat_mode_is_an_error():
+    raw = _raw(
+        gateway={
+            "mode": "compat_two_phase",
+            "three_phase": {"enabled": True},
+        }
+    )
+    with pytest.raises(ConfigError, match="choose gateway.mode"):
+        build_config(raw)
+
+
+def test_unknown_gateway_mode_is_rejected():
+    with pytest.raises(ConfigError, match="gateway.mode must be"):
+        build_config(_raw(gateway={"mode": "split_phase"}))
+
+
+def test_three_phase_movements_must_be_unique_and_complete():
+    duplicate = _three_phase_raw()
+    duplicate["gateway"]["three_phase"]["movements"] = {
+        "MAIN": "MAIN",
+        "SEC_A": "SIDE",
+        "SEC_B": "SIDE",
+    }
+    with pytest.raises(ConfigError, match="unique"):
+        build_config(duplicate)
+
+    extra = _three_phase_raw()
+    extra["gateway"]["three_phase"]["movements"]["NORTH"] = "NORTH"
+    with pytest.raises(ConfigError, match="unknown units"):
+        build_config(extra)
+
+
+def test_unknown_three_phase_keys_are_rejected():
+    raw = _three_phase_raw()
+    raw["gateway"]["three_phase"]["magic"] = True
+    with pytest.raises(ConfigError, match="unknown keys"):
+        build_config(raw)
 
 
 def test_source_factory_builds_each_type():

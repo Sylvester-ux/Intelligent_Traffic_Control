@@ -30,6 +30,7 @@ from camera.manager import CameraManager
 from decision.engine import Decision, DecisionEngine
 from decision.models import ApproachMetrics, Recommendation
 from detection.vehicle_detector import VehicleDetector
+from gateway.adapter import ProtocolAdapter
 from gateway.client import GatewayClient, RequestResult
 from pipeline.camera_pipeline import CameraPipeline
 
@@ -73,13 +74,22 @@ class Orchestrator:
         ]
 
         self.engine = DecisionEngine(config.units, config.decision)
+        self.adapter = ProtocolAdapter(
+            config.gateway_mode,
+            config.gateway_movements,
+            [unit.id for unit in config.units],
+            three_phase_enabled=config.three_phase_enabled,
+        )
         if gateway is not None:
             self.gateway: Optional[GatewayClient] = gateway
         elif dry_run:
             self.gateway = None
         else:
             self.gateway = GatewayClient(
-                config.gateway, self.health_gate_open, name="traffic"
+                config.gateway,
+                self.health_gate_open,
+                name="traffic",
+                movements=self.adapter.wire_movements,
             )
 
         self.decision_log: Optional[DecisionLog] = None
@@ -97,6 +107,9 @@ class Orchestrator:
         self._last_tick_at = None
         self._gate_state = None
 
+        for warning in self.adapter.startup_warnings():
+            _log.warning(warning)
+
         if self.config.logging.decision_log:
             self.decision_log = DecisionLog(
                 self.config.logging.decision_log,
@@ -113,8 +126,9 @@ class Orchestrator:
 
         self._started = True
         _log.info(
-            "orchestrator started: %d camera(s), dry_run=%s, display=%s",
+            "orchestrator started: %d camera(s), mode=%s, dry_run=%s, display=%s",
             len(self.pipelines),
+            self.config.gateway_mode,
             self.dry_run,
             self.display,
         )
@@ -199,34 +213,42 @@ class Orchestrator:
         return entry
 
     def _send(self, recommendation: Recommendation) -> dict:
+        wire = self.adapter.to_wire(recommendation)
         if self.dry_run or self.gateway is None:
-            return {"sent": False, "reason": "dry_run"}
+            return {
+                "sent": False,
+                "reason": "dry_run",
+                "unit_id": wire.unit_id,
+                "movement": wire.movement,
+            }
 
         result: RequestResult = self.gateway.request_green(
-            recommendation.unit_id, recommendation.green_time
+            wire.movement, wire.green_time
         )
         if result.ok:
             _log.info(
-                "request %s %ss accepted (sequence %s, %s ms)",
-                recommendation.unit_id,
-                recommendation.green_time,
+                "request %s/%s %ss accepted (sequence %s, %s ms)",
+                wire.unit_id,
+                wire.movement,
+                wire.green_time,
                 result.sequence,
                 round(result.latency_s * 1000),
             )
         else:
             _log.warning(
-                "request %s %ss not accepted: %s (%s)",
-                recommendation.unit_id,
-                recommendation.green_time,
+                "request %s/%s %ss not accepted: %s (%s)",
+                wire.unit_id,
+                wire.movement,
+                wire.green_time,
                 result.status,
                 result.reason,
             )
 
         return {
             "sent": True,
-            "unit_id": recommendation.unit_id,
-            "movement": recommendation.unit_id,
-            "green_time": recommendation.green_time,
+            "unit_id": wire.unit_id,
+            "movement": wire.movement,
+            "green_time": wire.green_time,
             "priority": "NORMAL",
             "sequence": result.sequence,
             "accepted": result.ok,
@@ -296,9 +318,17 @@ class Orchestrator:
         health = self.manager.health_all()
         recommendation = decision.recommendation
 
+        recommendation_log: Optional[dict] = None
+        if recommendation is not None:
+            recommendation_log = recommendation.to_log_dict()
+            recommendation_log["wire_movement"] = self.adapter.movement_for(
+                recommendation.unit_id
+            )
+
         return {
             "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
             "monotonic_s": round(now, 3),
+            "mode": self.config.gateway_mode,
             "health_gate_open": gate_open,
             "cameras": {
                 camera_id: {
@@ -337,9 +367,7 @@ class Orchestrator:
                 },
                 "reasons": list(decision.reasons),
             },
-            "recommendation": (
-                None if recommendation is None else recommendation.to_log_dict()
-            ),
+            "recommendation": recommendation_log,
             "request": request_info,
         }
 

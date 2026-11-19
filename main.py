@@ -32,6 +32,7 @@ from app.config import (
 from app.orchestrator import Orchestrator
 from decision.models import ServingUnit
 from decision.settings import DecisionSettings
+from gateway.adapter import COMPAT_MODE
 from gateway.client import GatewayConfig
 
 _log = logging.getLogger("main")
@@ -140,6 +141,8 @@ def config_from_source(spec: str) -> AppConfig:
         logging=LoggingConfig(decision_log=""),
         detection=DetectionConfig(),
         display=True,
+        gateway_mode=COMPAT_MODE,
+        gateway_movements={"MAIN": "MAIN"},
     )
 
 

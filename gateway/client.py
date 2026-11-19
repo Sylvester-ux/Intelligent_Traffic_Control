@@ -17,7 +17,7 @@ import socket
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
 
 from gateway.protocol import (
     GREEN_MAX,
@@ -82,9 +82,13 @@ class GatewayClient:
         health_check: Callable[[], bool],
         *,
         name: str = "gateway",
+        movements: Optional[Iterable[str]] = None,
     ) -> None:
         self.config = config
         self._health_check = health_check
+        # Current firmware names by default; the adapter may pass the proposed
+        # three-phase names after an explicit opt-in.
+        self._movements: tuple[str, ...] = tuple(movements or MOVEMENTS)
         self._log = logging.getLogger(f"gateway.client.{name}")
 
         self._stop = threading.Event()
@@ -150,9 +154,11 @@ class GatewayClient:
         self, movement: str, green_time: int, timeout: Optional[float] = None
     ) -> RequestResult:
         """Send one TRAFFIC_REQUEST and wait for its reply."""
-        if movement not in MOVEMENTS:
+        if movement not in self._movements:
             return RequestResult(
-                False, "INVALID_FIELDS", reason=f"unknown movement {movement!r}"
+                False,
+                "INVALID_FIELDS",
+                reason=f"movement {movement!r} not in {self._movements}",
             )
         if (
             not isinstance(green_time, int)
@@ -204,7 +210,10 @@ class GatewayClient:
                 sequence = self._next_sequence
                 self._next_sequence += 1
                 message = traffic_request_message(
-                    movement, message["green_time"], sequence
+                    movement,
+                    message["green_time"],
+                    sequence,
+                    movements=self._movements,
                 )
                 pending.sequence = sequence
 

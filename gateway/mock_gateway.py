@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from gateway.protocol import (
+    MOVEMENTS,
     LineBuffer,
     ProtocolError,
     ack_accepted,
@@ -72,12 +73,14 @@ class MockGateway:
         nack_rate: float = 0.0,
         timeout_rate: float = 0.0,
         seed: Optional[int] = None,
+        movements: Optional[list[str]] = None,
     ) -> None:
         self.host = host
         self.port = port
         self.heartbeat_freshness_s = heartbeat_freshness_s
         self.nack_rate = nack_rate
         self.timeout_rate = timeout_rate
+        self.movements: tuple[str, ...] = tuple(movements or MOVEMENTS)
         self._random = random.Random(seed)
 
         self._server: Optional[socket.socket] = None
@@ -264,7 +267,7 @@ class MockGateway:
     def _handle_traffic_request(
         self, conn: socket.socket, session: _Session, message: dict
     ) -> None:
-        reason = traffic_request_error(message)
+        reason = traffic_request_error(message, self.movements)
         if reason is not None:
             self._fail(conn, reason)
             return
@@ -346,11 +349,25 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--nack-rate", type=float, default=0.0)
     parser.add_argument("--timeout-rate", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--movements",
+        default=",".join(MOVEMENTS),
+        help=(
+            "comma-separated movements to accept. The default mimics the "
+            "current firmware. Any other value is HYPOTHETICAL: it lets the "
+            "host adapter be tested against a future gateway that does not "
+            "exist yet, e.g. MAIN,SECONDARY_A,SECONDARY_B."
+        ),
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s"
     )
+
+    movements = [item.strip() for item in args.movements.split(",") if item.strip()]
+    if not movements:
+        parser.error("--movements must name at least one movement")
 
     gateway = MockGateway(
         args.host,
@@ -359,6 +376,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         nack_rate=args.nack_rate,
         timeout_rate=args.timeout_rate,
         seed=args.seed,
+        movements=movements,
     )
     gateway.start()
     print(
@@ -367,6 +385,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "mock_gateway": "listening",
                 "host": args.host,
                 "port": gateway.port,
+                "movements": list(gateway.movements),
             }
         ),
         flush=True,

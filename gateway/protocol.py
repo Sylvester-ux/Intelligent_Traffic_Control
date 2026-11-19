@@ -117,10 +117,21 @@ def status_request_message() -> dict:
     return {"type": "STATUS_REQUEST"}
 
 
-def traffic_request_message(movement: str, green_time: int, sequence: int) -> dict:
-    """Build and validate a TRAFFIC_REQUEST (``priority`` is always NORMAL)."""
-    if movement not in MOVEMENTS:
-        raise ProtocolError(f"movement must be one of {MOVEMENTS}")
+def traffic_request_message(
+    movement: str,
+    green_time: int,
+    sequence: int,
+    movements: Iterable[str] = MOVEMENTS,
+) -> dict:
+    """Build and validate a TRAFFIC_REQUEST (``priority`` is always NORMAL).
+
+    ``movements`` defaults to what the current firmware accepts. The protocol
+    adapter may pass a hypothetical set when explicitly configured; see
+    ``gateway/adapter.py``.
+    """
+    allowed = tuple(movements)
+    if movement not in allowed:
+        raise ProtocolError(f"movement must be one of {allowed}")
     if not isinstance(green_time, int) or isinstance(green_time, bool):
         raise ProtocolError("green_time must be an integer")
     if not GREEN_MIN <= green_time <= GREEN_MAX:
@@ -138,9 +149,11 @@ def traffic_request_message(movement: str, green_time: int, sequence: int) -> di
     }
 
 
-def traffic_request_error(message: dict) -> Optional[str]:
+def traffic_request_error(
+    message: dict, movements: Iterable[str] = MOVEMENTS
+) -> Optional[str]:
     """Validate a received TRAFFIC_REQUEST; return an error reason or ``None``."""
-    if message.get("movement") not in MOVEMENTS:
+    if message.get("movement") not in tuple(movements):
         return "INVALID_FIELDS"
     green_time = message.get("green_time")
     if not isinstance(green_time, int) or isinstance(green_time, bool):

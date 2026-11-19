@@ -38,6 +38,31 @@ class AlternatingDetector:
         return [FakeResult(boxes)]
 
 
+class FixedCountDetector:
+    """Reports a base number of vehicles, toggling by one every 8 calls."""
+
+    names = {2: "car"}
+
+    def __init__(self, base: int) -> None:
+        self.base = base
+        self.calls = 0
+
+    def detect(self, frame: np.ndarray) -> list[FakeResult]:
+        self.calls += 1
+        count = self.base + (1 if (self.calls // 8) % 2 else 0)
+        coordinates = [
+            [40.0 + 40 * index, 100.0, 80.0 + 40 * index, 150.0]
+            for index in range(count)
+        ]
+        boxes = FakeBoxes(
+            ids=list(range(1, count + 1)),
+            classes=[2] * count,
+            confidences=[0.9] * count,
+            coordinates=coordinates,
+        )
+        return [FakeResult(boxes)]
+
+
 def _camera(camera_id: str, approach: str, path: Path) -> dict:
     return {
         "id": camera_id,
@@ -49,6 +74,23 @@ def _camera(camera_id: str, approach: str, path: Path) -> dict:
         "target_fps": 30,
         "stale_after_s": 2.0,
     }
+
+
+def _gateway_settings(gateway: MockGateway, **extra) -> dict:
+    settings = {
+        "host": "127.0.0.1",
+        "port": gateway.port,
+        "connect_timeout_s": 0.5,
+        "handshake_timeout_s": 1.0,
+        "request_timeout_s": 1.0,
+        "heartbeat_interval_s": 0.05,
+        "reconnect_min_s": 0.05,
+        "reconnect_max_s": 0.2,
+        "request_backoff_s": 0.05,
+    }
+    settings.update(extra)
+    return settings
+
 
 
 def test_three_cameras_to_mock_gateway(make_video, tmp_path):
@@ -74,17 +116,7 @@ def test_three_cameras_to_mock_gateway(make_video, tmp_path):
                 "min_delta_s": 0,
                 "idle_score_threshold": 0.5,
             },
-            "gateway": {
-                "host": "127.0.0.1",
-                "port": gateway.port,
-                "connect_timeout_s": 0.5,
-                "handshake_timeout_s": 1.0,
-                "request_timeout_s": 1.0,
-                "heartbeat_interval_s": 0.05,
-                "reconnect_min_s": 0.05,
-                "reconnect_max_s": 0.2,
-                "request_backoff_s": 0.05,
-            },
+            "gateway": _gateway_settings(gateway),
             "health": {
                 "tick_interval_s": 0.25,
                 "max_frame_age_s": 2.0,
@@ -136,3 +168,92 @@ def test_three_cameras_to_mock_gateway(make_video, tmp_path):
     assert entries[-1]["cameras"]["cam_main"]["state"] == "LIVE"
     assert orchestrator.gateway is not None
     assert orchestrator.gateway.connected is False  # stopped cleanly
+
+
+def test_three_phase_against_hypothetical_gateway(make_video, tmp_path):
+    """The target layout, against a mock that accepts the proposed names.
+
+    The mock is hypothetical: it stands in for firmware that does not exist.
+    """
+    clips = {
+        "MAIN": make_video("main.avi", frames=40, start_x=100, start_y=20, step_y=8, moving=False),
+        "SEC_A": make_video("sec_a.avi", frames=40, start_x=80, start_y=20, step_y=8, moving=False),
+        "SEC_B": make_video("sec_b.avi", frames=40, start_x=120, start_y=20, step_y=8, moving=False),
+    }
+    log_path = tmp_path / "decisions_three_phase.jsonl"
+    proposed = {
+        "MAIN": "MAIN",
+        "SEC_A": "SECONDARY_A",
+        "SEC_B": "SECONDARY_B",
+    }
+
+    with MockGateway(
+        port=0, movements=["MAIN", "SECONDARY_A", "SECONDARY_B"]
+    ) as gateway:
+        gateway_settings = _gateway_settings(gateway)
+        gateway_settings["mode"] = "three_phase"
+        gateway_settings["three_phase"] = {
+            "enabled": True,
+            "movements": proposed,
+        }
+        raw = {
+            "cameras": [
+                _camera("cam_main", "MAIN", clips["MAIN"]),
+                _camera("cam_sec_a", "SEC_A", clips["SEC_A"]),
+                _camera("cam_sec_b", "SEC_B", clips["SEC_B"]),
+            ],
+            "decision": {
+                "units": [
+                    {"id": "MAIN", "approaches": ["MAIN"]},
+                    {"id": "SEC_A", "approaches": ["SEC_A"]},
+                    {"id": "SEC_B", "approaches": ["SEC_B"]},
+                ],
+                "smoothing_window_s": 0,
+                "min_interval_s": 0,
+                "min_delta_s": 0,
+                "idle_score_threshold": 0.5,
+            },
+            "gateway": gateway_settings,
+            "health": {
+                "tick_interval_s": 0.25,
+                "max_frame_age_s": 2.0,
+                "tick_timeout_s": 2.0,
+            },
+            "logging": {"decision_log": str(log_path)},
+        }
+        config = build_config(raw)
+        counts = {"MAIN": 1, "SEC_A": 4, "SEC_B": 2}
+        orchestrator = Orchestrator(
+            config,
+            display=False,
+            detector_factory=lambda camera: FixedCountDetector(
+                counts[camera.approach]
+            ),
+        )
+        orchestrator.run(duration_s=3.0)
+        requests = gateway.traffic_requests
+
+    assert requests, "no request reached the hypothetical gateway"
+    assert [item["sequence"] for item in requests] == list(
+        range(1, len(requests) + 1)
+    )
+    # SEC_A has the most demand, and its proposal name is what goes on the wire.
+    assert {item["movement"] for item in requests} == {"SECONDARY_A"}
+    assert all(item["priority"] == "NORMAL" for item in requests)
+    assert all(5 <= item["green_time"] <= 30 for item in requests)
+
+    entries = [
+        json.loads(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert entries
+    for entry in entries:
+        assert entry["mode"] == "three_phase"
+        assert set(entry["units"]) == {"MAIN", "SEC_A", "SEC_B"}
+        assert set(entry["approaches"]) == {"MAIN", "SEC_A", "SEC_B"}
+        if entry["recommendation"] is not None:
+            assert entry["recommendation"]["unit_id"] == "SEC_A"
+            assert entry["recommendation"]["wire_movement"] == "SECONDARY_A"
+    assert entries[-1]["health_gate_open"] is True
+    assert orchestrator.gateway is not None
+    assert orchestrator.gateway.connected is False
