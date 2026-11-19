@@ -20,6 +20,10 @@ def write_test_video(
     fps: float = 15.0,
     start_x: int = 10,
     step: int = 6,
+    start_y: int = 100,
+    step_y: int = 0,
+    rect_width: int = 30,
+    rect_height: int = 50,
     moving: bool = True,
 ) -> Path:
     """Render a tiny MJPG clip with one bright rectangle on a dark background."""
@@ -30,8 +34,15 @@ def write_test_video(
         pytest.skip("OpenCV MJPG writer unavailable in this build")
     for i in range(frames):
         image = np.zeros((height, width, 3), dtype=np.uint8)
-        x = (start_x + i * step) % max(1, width - 40) if moving else start_x
-        cv2.rectangle(image, (x, 100), (x + 30, 150), (0, 255, 0), -1)
+        x = (start_x + i * step) % max(1, width - rect_width - 10) if moving else start_x
+        y = min(max(0, start_y + i * step_y), height - rect_height - 1)
+        cv2.rectangle(
+            image,
+            (x, y),
+            (x + rect_width, y + rect_height),
+            (0, 255, 0),
+            -1,
+        )
         writer.write(image)
     writer.release()
     return path

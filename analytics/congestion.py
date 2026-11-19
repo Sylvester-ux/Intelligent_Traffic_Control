@@ -9,7 +9,8 @@ class CongestionAnalyzer:
         window_seconds=10,
         moderate_threshold=3,
         high_threshold=8,
-        stationary_threshold=0.5
+        stationary_threshold=0.5,
+        moderate_stationary_ratio=0.3
     ):
 
         self.window_seconds = window_seconds
@@ -17,6 +18,7 @@ class CongestionAnalyzer:
         self.moderate_threshold = moderate_threshold
         self.high_threshold = high_threshold
         self.stationary_threshold = stationary_threshold
+        self.moderate_stationary_ratio = moderate_stationary_ratio
 
         self.observations = deque()
 
@@ -76,7 +78,7 @@ class CongestionAnalyzer:
 
         elif (
             average_vehicle_count >= self.moderate_threshold
-            and average_stationary_ratio >= 0.3
+            and average_stationary_ratio >= self.moderate_stationary_ratio
         ):
             congestion_level = "Moderate"
 
