@@ -32,7 +32,7 @@ from app.config import (
 from app.orchestrator import Orchestrator
 from decision.models import ServingUnit
 from decision.settings import DecisionSettings
-from gateway.adapter import COMPAT_MODE
+from gateway.adapter import COMPAT_MODE, THREE_PHASE_MODE
 from gateway.client import GatewayConfig
 
 _log = logging.getLogger("main")
@@ -175,6 +175,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         if args.dry_run:
             _log.warning("--dry-run wins over --mock-gateway; no gateway is used")
+        elif config.gateway_mode == THREE_PHASE_MODE:
+            _log.warning(
+                "three_phase mode with --mock-gateway: start the mock with "
+                "--movements MAIN,SECONDARY_A,SECONDARY_B or it will reject "
+                "the proposed names"
+            )
 
     display = (args.display or config.display) and not args.headless
     orchestrator = Orchestrator(config, display=display, dry_run=args.dry_run)

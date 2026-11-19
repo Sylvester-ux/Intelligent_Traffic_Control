@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-
 import pytest
 
 from decision.models import Recommendation
@@ -12,7 +10,7 @@ from gateway.adapter import (
     THREE_PHASE_MODE,
     ProtocolAdapter,
 )
-from gateway.protocol import MAX_LINE_BYTES, ProtocolError
+from gateway.protocol import MAX_LINE_BYTES, ProtocolError, encode_message
 
 
 def recommendation(unit_id: str = "MAIN", green: int = 12) -> Recommendation:
@@ -105,7 +103,7 @@ def test_unknown_unit_is_a_protocol_error():
 def test_build_message_is_compact_newline_terminated_and_within_the_limit():
     adapter = three_phase_adapter()
     message = adapter.build_message(recommendation("SEC_B", 15), sequence=104)
-    payload = json.dumps(message, separators=(",", ":")).encode("utf-8") + b"\n"
+    payload = encode_message(message)
 
     assert message == {
         "type": "TRAFFIC_REQUEST",
@@ -114,11 +112,16 @@ def test_build_message_is_compact_newline_terminated_and_within_the_limit():
         "priority": "NORMAL",
         "sequence": 104,
     }
+    assert payload == (
+        b'{"type":"TRAFFIC_REQUEST","movement":"SECONDARY_B","green_time":15,'
+        b'"priority":"NORMAL","sequence":104}\n'
+    )
     assert b" " not in payload
-    assert payload.endswith(b"\n")
     assert len(payload) <= MAX_LINE_BYTES
 
 
 def test_adapter_refuses_green_time_outside_the_protocol():
     with pytest.raises(ProtocolError):
         compat_adapter().to_wire(recommendation("MAIN", 45))
+    with pytest.raises(ProtocolError):
+        compat_adapter().to_wire(recommendation("MAIN", 4))
