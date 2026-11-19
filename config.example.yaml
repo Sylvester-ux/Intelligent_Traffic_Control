@@ -1,0 +1,113 @@
+# Smarti AI host configuration.
+#
+# Copy to config.yaml (ignored by git) and edit. Credentials are read from the
+# environment: export CAM_USER=... and CAM_PASS=... before running.
+#
+# Nothing here has been validated on hardware. Values are starting points.
+
+cameras:
+  # Three approaches, one camera each, all on the wired Ethernet switch.
+  # Use each camera's SUB-stream (720p, H.264, 5-15 fps), not the main stream.
+  - id: cam_main
+    approach: MAIN
+    source: rtsp
+    url: "rtsp://${CAM_USER}:${CAM_PASS}@192.168.50.11:554/stream2"  # path varies by vendor
+    flip: false
+    target_fps: 8
+    count_line: 0.4
+    # polygon: [[0.1, 0.3], [0.9, 0.3], [1.0, 0.95], [0.0, 0.95]]
+
+  - id: cam_sec_a
+    approach: SEC_A
+    source: rtsp
+    url: "rtsp://${CAM_USER}:${CAM_PASS}@192.168.50.12:554/stream2"
+    flip: false
+    target_fps: 8
+    count_line: 0.4
+
+  - id: cam_sec_b
+    approach: SEC_B
+    source: rtsp
+    url: "rtsp://${CAM_USER}:${CAM_PASS}@192.168.50.13:554/stream2"
+    flip: false
+    target_fps: 8
+    count_line: 0.4
+
+  # --- Development without cameras -----------------------------------------
+  # Replace the entries above with looping video files:
+  #
+  # - id: cam_main
+  #   approach: MAIN
+  #   source: file
+  #   path: samples/main.avi
+  #   loop: true
+  #   realtime: true
+  #   target_fps: 8
+  #
+  # Or a local webcam:
+  #
+  # - id: cam_main
+  #   approach: MAIN
+  #   source: webcam
+  #   index: 0
+  #   flip: true
+
+# Two-phase compatibility mode: the firmware only knows MAIN and SECONDARY.
+# SEC_A and SEC_B are reported separately but share the SECONDARY movement.
+approaches:
+  MAIN: MAIN
+  SEC_A: SECONDARY
+  SEC_B: SECONDARY
+
+phase_mode: two_phase_compat
+
+decision:
+  weights:
+    queue: 1.0        # per vehicle inside the road region
+    stationary: 1.5   # per stopped vehicle
+    wait: 0.1         # per second the longest waiter has been stopped
+    congestion: 1.0   # Low=0, Moderate=1, High=2
+  base_green_s: 8
+  k_green_s: 10
+  score_saturation: 10   # score treated as "fully loaded"
+  min_green_s: 5         # protocol range is 5-30; config may narrow it
+  max_green_s: 30
+  min_delta_s: 3         # ignore green changes of 3 s or less
+  min_interval_s: 8      # never send requests faster than this
+  max_wait_before_force_s: 60
+  smoothing_window_s: 5
+  max_metrics_age_s: 2
+  idle_score_threshold: 1.0
+  aggregation: sum       # sum|max for {SEC_A, SEC_B} -> SECONDARY demand
+  require_all_approaches_healthy: true
+
+gateway:
+  host: 192.168.4.1      # ESP32 SoftAP "Smarti-Gateway"; password via env only
+  port: 3333
+  connect_timeout_s: 3.0
+  handshake_timeout_s: 2.0
+  request_timeout_s: 2.0
+  heartbeat_interval_s: 1.0
+  reconnect_min_s: 1.0
+  reconnect_max_s: 10.0
+  request_backoff_s: 2.0
+
+health:
+  max_frame_age_s: 2.0
+  tick_interval_s: 1.0
+  tick_timeout_s: 2.0
+  required_cameras: 3    # null = all configured cameras
+
+detection:
+  model: yolo11n.pt
+  device: auto           # auto|cuda|cpu
+  confidence: 0.3
+  # imgsz: 640
+
+logging:
+  level: INFO
+  decision_log: logs/decisions.jsonl
+  max_bytes: 5242880
+  backup_count: 3
+
+display: false

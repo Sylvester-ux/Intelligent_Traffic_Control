@@ -117,8 +117,16 @@ class CameraPipeline:
         self._thread.start()
         _log.info("pipeline %s (approach %s) started", self.camera_id, self.approach_id)
 
-    def stop(self) -> None:
+    def request_stop(self) -> None:
+        """Ask the worker to exit without waiting for it.
+
+        Lets the orchestrator signal every pipeline before joining any of
+        them, so shutdown time is bounded once instead of once per camera.
+        """
         self._stop.set()
+
+    def stop(self) -> None:
+        self.request_stop()
         if self._thread is not None:
             self._thread.join(timeout=5.0)
             self._thread = None
