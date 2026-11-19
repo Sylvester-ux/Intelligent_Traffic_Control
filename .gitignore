@@ -16,7 +16,6 @@ __pycache__/
 # IDE configurations
 .idea/
 
-
 # Jupyter Notebook
 .ipynb_checkpoints/
 
@@ -41,3 +40,6 @@ data/processed/
 *.onnx
 *.h5
 *.joblib
+
+# Agent tooling
+.freebuff/
