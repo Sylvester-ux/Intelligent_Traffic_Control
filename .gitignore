@@ -8,6 +8,9 @@ try
 __pycache__/
 *.py[cod]
 
+# Local configuration (may hold credentials)
+config.yaml
+
 # Environment variables and secrets
 .env
 .env.*
@@ -16,12 +19,12 @@ __pycache__/
 # IDE configurations
 .idea/
 
-
 # Jupyter Notebook
 .ipynb_checkpoints/
 
 # Logs
 *.log
+logs/
 
 # OS files
 .DS_Store
@@ -41,3 +44,6 @@ data/processed/
 *.onnx
 *.h5
 *.joblib
+
+# Agent tooling
+.freebuff/
