@@ -355,6 +355,7 @@ class Orchestrator:
                         if unit.id not in decision.unit_scores
                         else round(decision.unit_scores[unit.id], 3)
                     ),
+                    "expected_red_s": decision.expected_red_s.get(unit.id),
                 }
                 for unit in self.config.units
             },
@@ -364,6 +365,10 @@ class Orchestrator:
                 "unit_scores": {
                     unit_id: round(score, 3)
                     for unit_id, score in decision.unit_scores.items()
+                },
+                "expected_red_s": {
+                    unit_id: round(value, 1)
+                    for unit_id, value in decision.expected_red_s.items()
                 },
                 "reasons": list(decision.reasons),
             },

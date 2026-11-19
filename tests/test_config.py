@@ -313,6 +313,67 @@ def test_unknown_three_phase_keys_are_rejected():
         build_config(raw)
 
 
+def _two_unit_raw(**decision) -> dict:
+    raw = {
+        "cameras": [
+            _camera(),
+            _camera(id="cam_sec", approach="SEC"),
+        ],
+        "decision": {
+            "units": _units(
+                ("MAIN", ("MAIN",)),
+                ("SECONDARY", ("SEC",)),
+            )
+        },
+    }
+    raw["decision"].update(decision)
+    return raw
+
+
+def test_example_red_model_is_configured():
+    config = load_config("config.example.yaml", env=ENV)
+    assert config.decision.yellow_s == 3.0
+    assert config.decision.all_red_s == 1.0
+    assert config.decision.max_red_s == 90.0
+    assert config.decision.green_memory_s == 120.0
+
+
+def test_max_red_accepts_a_scalar_for_every_unit():
+    config = build_config(_two_unit_raw(max_red_s=45))
+    assert config.decision.max_red_s == 45.0
+    assert config.decision.max_red_s_by_unit == {}
+
+
+def test_max_red_accepts_a_complete_per_unit_mapping():
+    config = build_config(
+        _two_unit_raw(max_red_s={"MAIN": 30, "SECONDARY": 60})
+    )
+    assert config.decision.max_red_s_by_unit == {
+        "MAIN": 30.0,
+        "SECONDARY": 60.0,
+    }
+
+
+def test_max_red_mapping_must_cover_known_units():
+    with pytest.raises(ConfigError, match="cap every unit"):
+        build_config(_two_unit_raw(max_red_s={"MAIN": 30}))
+    with pytest.raises(ConfigError, match="unknown units"):
+        build_config(
+            _two_unit_raw(
+                max_red_s={"MAIN": 30, "SECONDARY": 60, "NORTH": 90}
+            )
+        )
+
+
+def test_max_red_and_clearances_are_validated():
+    with pytest.raises(ConfigError, match="must be a number"):
+        build_config(_two_unit_raw(max_red_s="ninety"))
+    with pytest.raises(ConfigError, match="must be positive"):
+        build_config(_two_unit_raw(max_red_s=-5))
+    with pytest.raises(ConfigError, match="non-negative"):
+        build_config(_two_unit_raw(yellow_s=-1))
+
+
 def test_source_factory_builds_each_type():
     common = {"id": "cam", "approach": "MAIN"}
     webcam = build_source(CameraConfig(source="webcam", index=1, **common))

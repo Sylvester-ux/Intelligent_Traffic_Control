@@ -151,9 +151,13 @@ def test_three_cameras_to_mock_gateway(make_video, tmp_path):
         assert set(entry["units"]) == {"MAIN", "SECONDARY"}
         assert set(entry["decision"]["unit_scores"]) <= set(entry["units"])
         assert entry["decision"]["reasons"]
+        assert set(entry["decision"]["expected_red_s"]) == set(entry["units"])
         assert set(entry["cameras"]) == {"cam_main", "cam_sec_a", "cam_sec_b"}
         if entry["recommendation"] is not None:
             assert entry["recommendation"]["unit_id"] in entry["units"]
+            assert entry["recommendation"]["expected_red_s"] == (
+                entry["decision"]["expected_red_s"]
+            )
 
     accepted = [
         entry
@@ -251,6 +255,13 @@ def test_three_phase_against_hypothetical_gateway(make_video, tmp_path):
         assert entry["mode"] == "three_phase"
         assert set(entry["units"]) == {"MAIN", "SEC_A", "SEC_B"}
         assert set(entry["approaches"]) == {"MAIN", "SEC_A", "SEC_B"}
+        assert set(entry["decision"]["expected_red_s"]) == {
+            "MAIN",
+            "SEC_A",
+            "SEC_B",
+        }
+        for unit in entry["units"].values():
+            assert unit["expected_red_s"] is not None
         if entry["recommendation"] is not None:
             assert entry["recommendation"]["unit_id"] == "SEC_A"
             assert entry["recommendation"]["wire_movement"] == "SECONDARY_A"

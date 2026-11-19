@@ -276,6 +276,68 @@ def test_smoothing_dampens_single_frame_spike():
     assert not any("idle" in reason for reason in decision.reasons)
 
 
+def test_expected_red_uses_the_other_greens_and_clearances():
+    decision_engine = engine(yellow_s=3, all_red_s=1)
+    decision = decision_engine.evaluate(
+        feed(100.0, MAIN={"queue": 20}), 100.0
+    )
+
+    assert decision.recommendation.green_time == 18
+    # MAIN waits for SECONDARY's expected green (default 8) and one clearance.
+    # SECONDARY waits for the green just recommended to MAIN plus one clearance.
+    assert decision.expected_red_s == {"MAIN": 12.0, "SECONDARY": 22.0}
+    assert decision.recommendation.expected_red_s == decision.expected_red_s
+
+
+def test_expected_red_falls_back_to_the_default_after_memory_expires():
+    decision_engine = engine(yellow_s=3, all_red_s=1, green_memory_s=0)
+    decision_engine.evaluate(feed(100.0, MAIN={"queue": 20}), 100.0)
+
+    # MAIN's 18 s green is no longer remembered, so both units expect base 8.
+    decision = decision_engine.evaluate(
+        feed(101.0, MAIN={"queue": 20}), 101.0
+    )
+    assert decision.expected_red_s == {"MAIN": 12.0, "SECONDARY": 12.0}
+
+
+def test_max_red_guard_forces_a_unit_that_would_wait_too_long():
+    decision_engine = engine(
+        min_interval_s=0,
+        min_delta_s=0,
+        max_wait_before_force_s=1000,
+        yellow_s=3,
+        all_red_s=1,
+        max_red_s_by_unit={"MAIN": 90.0, "SECONDARY": 10.0},
+    )
+    decision_engine.evaluate(feed(0.0, MAIN={"queue": 20}), 0.0)
+
+    # SECONDARY is lightly loaded but its estimated red (18 + 4 = 22 s)
+    # exceeds its 10 s cap, so it must not be starved by the 60 s wall clock.
+    decision = decision_engine.evaluate(
+        feed(1.0, MAIN={"queue": 20}, SEC_A={"queue": 2}), 1.0
+    )
+    assert decision.emitted, decision.reasons
+    assert decision.recommendation.unit_id == "SECONDARY"
+    assert any(
+        "estimated red" in reason and "cap" in reason
+        for reason in decision.reasons
+    )
+
+
+def test_max_red_guard_does_not_invent_demand():
+    decision_engine = engine(
+        min_interval_s=0,
+        min_delta_s=0,
+        max_wait_before_force_s=1000,
+        max_red_s_by_unit={"MAIN": 90.0, "SECONDARY": 10.0},
+    )
+    decision_engine.evaluate(feed(0.0, MAIN={"queue": 20}), 0.0)
+    decision = decision_engine.evaluate(feed(1.0, MAIN={"queue": 20}), 1.0)
+
+    assert decision.unit_scores["MAIN"] > decision.unit_scores["SECONDARY"]
+    assert not any("starvation" in reason for reason in decision.reasons)
+
+
 def test_settings_reject_out_of_protocol_green_range():
     with pytest.raises(ValueError):
         DecisionSettings(min_green_s=3)

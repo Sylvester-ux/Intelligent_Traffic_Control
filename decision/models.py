@@ -114,6 +114,7 @@ class Recommendation:
     priority: str = "NORMAL"
     reasons: tuple[str, ...] = field(default_factory=tuple)
     scores: Mapping[str, float] = field(default_factory=dict)
+    expected_red_s: Mapping[str, float] = field(default_factory=dict)
 
     def to_log_dict(self) -> dict:
         return {
@@ -122,4 +123,8 @@ class Recommendation:
             "priority": self.priority,
             "reasons": list(self.reasons),
             "scores": {key: round(value, 3) for key, value in self.scores.items()},
+            "expected_red_s": {
+                key: round(value, 1)
+                for key, value in self.expected_red_s.items()
+            },
         }

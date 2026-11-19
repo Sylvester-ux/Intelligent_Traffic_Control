@@ -35,6 +35,7 @@ class Decision:
     recommendation: Optional[Recommendation]
     reasons: tuple[str, ...]
     unit_scores: Mapping[str, float]
+    expected_red_s: Mapping[str, float]
     healthy: bool
 
     @property
@@ -88,6 +89,8 @@ class DecisionEngine:
         self._last_request_at: Optional[float] = None
         self._last_green: Optional[int] = None
         self._last_unit: Optional[str] = None
+        self._expected_green: dict[str, int] = {}
+        self._expected_green_at: dict[str, float] = {}
 
     # -- public -----------------------------------------------------------
 
@@ -100,6 +103,7 @@ class DecisionEngine:
             for unit_id in self.units:
                 self._last_served[unit_id] = now
 
+        expected_red_s = self._expected_reds(now)
         healthy_ids, unhealthy_ids = self._classify_health(metrics, now)
         reasons: list[str] = []
 
@@ -109,11 +113,15 @@ class DecisionEngine:
                 reasons.append(
                     "policy: no recommendation while any approach is unhealthy"
                 )
-                return Decision(None, tuple(reasons), {}, healthy=False)
+                return Decision(
+                    None, tuple(reasons), {}, expected_red_s, healthy=False
+                )
 
         if not healthy_ids:
             reasons.append("no healthy approaches")
-            return Decision(None, tuple(reasons), {}, healthy=False)
+            return Decision(
+                None, tuple(reasons), {}, expected_red_s, healthy=False
+            )
 
         healthy_set = set(healthy_ids)
         smoothed = {
@@ -141,21 +149,33 @@ class DecisionEngine:
 
         if not scores:
             reasons.append("no scored units")
-            return Decision(None, tuple(reasons), {}, healthy=False)
+            return Decision(
+                None, tuple(reasons), {}, expected_red_s, healthy=False
+            )
 
         if max(scores.values()) < self.settings.idle_score_threshold:
             reasons.append(
                 f"idle: all unit scores below {self.settings.idle_score_threshold}"
             )
-            return Decision(None, tuple(reasons), scores, healthy=True)
+            return Decision(
+                None, tuple(reasons), scores, expected_red_s, healthy=True
+            )
 
-        winner, forced = self._choose_winner(scores, now)
+        winner, forced = self._choose_winner(scores, now, expected_red_s)
         forced = forced and winner != self._last_unit
         if forced:
-            reasons.append(
-                f"starvation guard: {winner} waited more than "
-                f"{self.settings.max_wait_before_force_s:.0f}s with demand"
-            )
+            cap = self._max_red_for(winner)
+            if expected_red_s.get(winner, 0.0) > cap:
+                reasons.append(
+                    f"starvation guard: {winner} estimated red "
+                    f"{expected_red_s[winner]:.1f}s exceeds cap {cap:.1f}s "
+                    "with demand"
+                )
+            else:
+                reasons.append(
+                    f"starvation guard: {winner} waited more than "
+                    f"{self.settings.max_wait_before_force_s:.0f}s with demand"
+                )
         reasons.append("scores: " + "; ".join(details))
 
         green_time, clamp_note = self._green_time(scores[winner])
@@ -164,15 +184,21 @@ class DecisionEngine:
         blocked = self._change_gate(winner, green_time, now)
         if blocked is not None:
             reasons.append(blocked)
-            return Decision(None, tuple(reasons), scores, healthy=True)
+            return Decision(
+                None, tuple(reasons), scores, expected_red_s, healthy=True
+            )
 
         reasons.append(f"recommend {winner} green {green_time}s (advisory only)")
+        expected_red_s = self._expected_reds(
+            now, override=(winner, green_time)
+        )
         recommendation = Recommendation(
             unit_id=winner,
             green_time=green_time,
             priority="NORMAL",
             reasons=tuple(reasons),
             scores=scores,
+            expected_red_s=expected_red_s,
         )
 
         self._record_emission(winner, green_time, now)
@@ -181,6 +207,7 @@ class DecisionEngine:
             recommendation=recommendation,
             reasons=tuple(reasons),
             unit_scores=scores,
+            expected_red_s=expected_red_s,
             healthy=True,
         )
 
@@ -193,6 +220,8 @@ class DecisionEngine:
         self._last_request_at = None
         self._last_green = None
         self._last_unit = None
+        self._expected_green.clear()
+        self._expected_green_at.clear()
 
     # -- health -----------------------------------------------------------
 
@@ -281,15 +310,22 @@ class DecisionEngine:
         return sum(values)
 
     def _choose_winner(
-        self, scores: Mapping[str, float], now: float
+        self,
+        scores: Mapping[str, float],
+        now: float,
+        expected_red_s: Mapping[str, float],
     ) -> tuple[str, bool]:
         """Highest score, unless a starving unit with demand must go first."""
         starving = [
             unit_id
             for unit_id, score in scores.items()
             if score >= self.settings.idle_score_threshold
-            and now - self._last_served.get(unit_id, now)
-            > self.settings.max_wait_before_force_s
+            and (
+                now - self._last_served.get(unit_id, now)
+                > self.settings.max_wait_before_force_s
+                or expected_red_s.get(unit_id, 0.0)
+                > self._max_red_for(unit_id)
+            )
         ]
         if starving:
             # Deterministic: longest wait wins; the unit that was just served
@@ -309,6 +345,55 @@ class DecisionEngine:
             key=lambda unit_id: (scores[unit_id], -list(self.units).index(unit_id)),
         )
         return winner, False
+
+    def _max_red_for(self, unit_id: str) -> float:
+        return float(
+            self.settings.max_red_s_by_unit.get(unit_id, self.settings.max_red_s)
+        )
+
+    def _expected_green_for(
+        self,
+        unit_id: str,
+        now: float,
+        override: Optional[tuple[str, int]] = None,
+    ) -> int:
+        """The green this unit is expected to receive in the current cycle."""
+        if override is not None and override[0] == unit_id:
+            return override[1]
+        green = self._expected_green.get(unit_id)
+        if green is not None:
+            remembered_at = self._expected_green_at.get(unit_id, now)
+            if now - remembered_at <= self.settings.green_memory_s:
+                return green
+        return max(
+            self.settings.min_green_s,
+            min(self.settings.max_green_s, int(round(self.settings.base_green_s))),
+        )
+
+    def _expected_reds(
+        self,
+        now: float,
+        override: Optional[tuple[str, int]] = None,
+    ) -> dict[str, float]:
+        """Estimated red per unit: the other greens plus clearances between.
+
+        This is a model only. The controller owns phase order and the actual
+        yellow/all-red interval; the host never sends a red duration.
+        """
+        greens = {
+            unit_id: self._expected_green_for(unit_id, now, override)
+            for unit_id in self.units
+        }
+        clearance = self.settings.yellow_s + self.settings.all_red_s
+        expected: dict[str, float] = {}
+        for unit_id in self.units:
+            others = [other for other in self.units if other != unit_id]
+            expected[unit_id] = round(
+                sum(greens[other] for other in others)
+                + len(others) * clearance,
+                1,
+            )
+        return expected
 
     def _green_time(self, winner_score: float) -> tuple[int, str]:
         normalized = min(1.0, max(0.0, winner_score) / self.settings.score_saturation)
@@ -351,3 +436,5 @@ class DecisionEngine:
         self._last_green = green_time
         self._last_unit = unit_id
         self._last_served[unit_id] = now
+        self._expected_green[unit_id] = green_time
+        self._expected_green_at[unit_id] = now

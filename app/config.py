@@ -184,7 +184,7 @@ def build_config(raw: Mapping[str, Any], *, base_dir: Optional[Path] = None) -> 
         raise ConfigError("'decision' must be a mapping")
     units = _units_from(decision_raw.get("units"))
     _validate_units(units, set(approach_owners))
-    decision = _decision_settings(decision_raw)
+    decision = _decision_settings(decision_raw, units)
 
     gateway_data, gateway_mode, three_phase_enabled, gateway_movements = (
         _gateway_options(raw.get("gateway"), units)
@@ -474,7 +474,9 @@ def _gateway_options(
     return data, mode, True, movements
 
 
-def _decision_settings(raw: Mapping[str, Any]) -> DecisionSettings:
+def _decision_settings(
+    raw: Mapping[str, Any], units: tuple[ServingUnit, ...]
+) -> DecisionSettings:
     allowed = {
         "weights",
         "base_green_s",
@@ -491,6 +493,10 @@ def _decision_settings(raw: Mapping[str, Any]) -> DecisionSettings:
         "aggregation",
         "require_all_approaches_healthy",
         "units",
+        "yellow_s",
+        "all_red_s",
+        "max_red_s",
+        "green_memory_s",
     }
     unknown = set(raw) - allowed
     if unknown:
@@ -507,9 +513,45 @@ def _decision_settings(raw: Mapping[str, Any]) -> DecisionSettings:
         "weights": weights,
         "aggregation": aggregation,
     }
-    for key in allowed - {"weights", "aggregation", "units"}:
+    reserved = {"weights", "aggregation", "units", "max_red_s"}
+    for key in allowed - reserved:
         if key in raw:
             kwargs[key] = raw[key]
+
+    if "max_red_s" in raw:
+        max_red_raw = raw["max_red_s"]
+        unit_ids = [unit.id for unit in units]
+        if isinstance(max_red_raw, Mapping):
+            missing = [unit_id for unit_id in unit_ids if unit_id not in max_red_raw]
+            extra = set(max_red_raw) - set(unit_ids)
+            if missing:
+                raise ConfigError(
+                    "decision.max_red_s must cap every unit; missing "
+                    f"{missing} (or use a single number for all units)"
+                )
+            if extra:
+                raise ConfigError(
+                    "decision.max_red_s names unknown units: "
+                    f"{sorted(extra)}"
+                )
+            caps: dict[str, float] = {}
+            for unit_id in unit_ids:
+                cap = max_red_raw[unit_id]
+                if isinstance(cap, bool) or not isinstance(cap, (int, float)):
+                    raise ConfigError(
+                        f"decision.max_red_s[{unit_id!r}] must be a number"
+                    )
+                caps[unit_id] = float(cap)
+            kwargs["max_red_s_by_unit"] = caps
+            kwargs["max_red_s"] = max(caps.values())
+        elif isinstance(max_red_raw, bool) or not isinstance(
+            max_red_raw, (int, float)
+        ):
+            raise ConfigError(
+                "decision.max_red_s must be a number or a unit->seconds mapping"
+            )
+        else:
+            kwargs["max_red_s"] = float(max_red_raw)
 
     try:
         return DecisionSettings(**kwargs)

@@ -41,6 +41,20 @@ class DecisionSettings:
     # fairness
     max_wait_before_force_s: float = 60.0
 
+    # Clearance between two greens. Starting values that match the controller
+    # README; they are likely to differ in final firmware.
+    yellow_s: float = 3.0
+    all_red_s: float = 1.0
+
+    # Cap on how long a unit with demand may wait. ``max_red_s_by_unit``
+    # overrides the scalar for named units (config accepts either form).
+    max_red_s: float = 90.0
+    max_red_s_by_unit: dict[str, float] = field(default_factory=dict)
+
+    # How long a recommendation keeps counting as the expected green of its
+    # unit before the default (base_green_s) is used instead.
+    green_memory_s: float = 120.0
+
     # noise control
     smoothing_window_s: float = 5.0
     max_metrics_age_s: float = 2.0
@@ -70,6 +84,19 @@ class DecisionSettings:
             raise ValueError("aggregation must be 'sum' or 'max'")
         if self.smoothing_window_s < 0:
             raise ValueError("smoothing_window_s must be non-negative")
+        if self.yellow_s < 0 or self.all_red_s < 0:
+            raise ValueError("yellow_s and all_red_s must be non-negative")
+        if self.max_red_s <= 0:
+            raise ValueError("max_red_s must be positive")
+        for unit_id, cap in self.max_red_s_by_unit.items():
+            if not isinstance(unit_id, str) or not unit_id:
+                raise ValueError("max_red_s_by_unit keys must be unit ids")
+            if cap <= 0:
+                raise ValueError(
+                    f"max_red_s for unit {unit_id!r} must be positive"
+                )
+        if self.green_memory_s < 0:
+            raise ValueError("green_memory_s must be non-negative")
 
 
 DEFAULT_SETTINGS = DecisionSettings()

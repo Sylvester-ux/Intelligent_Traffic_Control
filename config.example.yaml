@@ -82,6 +82,17 @@ decision:
   min_delta_s: 3         # ignore green changes of 3 s or less
   min_interval_s: 8      # never send requests faster than this
   max_wait_before_force_s: 60
+
+  # Clearance values are placeholders that match the controller README; they
+  # may differ in final firmware. The host never sends red or yellow.
+  yellow_s: 3
+  all_red_s: 1
+  # Cap on estimated waiting time for a unit with demand. A single number
+  # applies to every unit; a mapping caps units individually:
+  # max_red_s: {MAIN: 90, SECONDARY: 120}
+  max_red_s: 90
+  green_memory_s: 120   # how long a sent green counts as this unit's expected green
+
   smoothing_window_s: 5
   max_metrics_age_s: 2
   idle_score_threshold: 1.0
