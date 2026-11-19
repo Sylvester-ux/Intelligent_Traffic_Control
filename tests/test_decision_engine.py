@@ -5,10 +5,18 @@ from __future__ import annotations
 import pytest
 
 from decision.engine import DecisionEngine
-from decision.models import ApproachMetrics
+from decision.models import ApproachMetrics, ServingUnit
 from decision.settings import DecisionSettings
 
-APPROACHES = {"MAIN": "MAIN", "SEC_A": "SECONDARY", "SEC_B": "SECONDARY"}
+COMPAT_UNITS = (
+    ServingUnit("MAIN", ("MAIN",)),
+    ServingUnit("SECONDARY", ("SEC_A", "SEC_B")),
+)
+THREE_UNITS = (
+    ServingUnit("MAIN", ("MAIN",)),
+    ServingUnit("SEC_A", ("SEC_A",)),
+    ServingUnit("SEC_B", ("SEC_B",)),
+)
 
 
 def metrics(
@@ -48,9 +56,9 @@ def feed(now: float, **overrides) -> dict[str, ApproachMetrics]:
     return base
 
 
-def engine(**settings_kwargs) -> DecisionEngine:
+def engine(units=COMPAT_UNITS, **settings_kwargs) -> DecisionEngine:
     settings_kwargs.setdefault("smoothing_window_s", 0.0)
-    return DecisionEngine(APPROACHES, DecisionSettings(**settings_kwargs))
+    return DecisionEngine(units, DecisionSettings(**settings_kwargs))
 
 
 def test_busy_main_gets_the_green():
@@ -66,10 +74,40 @@ def test_busy_main_gets_the_green():
 
     assert decision.emitted, decision.reasons
     recommendation = decision.recommendation
-    assert recommendation.movement == "MAIN"
+    assert recommendation.unit_id == "MAIN"
     assert recommendation.priority == "NORMAL"
     assert 5 <= recommendation.green_time <= 30
     assert any("recommend MAIN" in reason for reason in recommendation.reasons)
+
+
+def test_three_unit_layout_scores_each_approach_on_its_own():
+    decision_engine = engine(THREE_UNITS)
+    decision = decision_engine.evaluate(
+        feed(
+            100.0,
+            MAIN={"queue": 4},
+            SEC_A={"queue": 3},
+            SEC_B={"queue": 1},
+        ),
+        100.0,
+    )
+
+    assert decision.unit_scores == {"MAIN": 4.0, "SEC_A": 3.0, "SEC_B": 1.0}
+    assert decision.recommendation.unit_id == "MAIN"
+
+
+def test_two_and_three_unit_layouts_score_the_same_metrics_consistently():
+    snapshots = feed(100.0, MAIN={"queue": 5}, SEC_A={"queue": 4}, SEC_B={"queue": 0})
+
+    compat = engine(COMPAT_UNITS).evaluate(snapshots, 100.0)
+    three = engine(THREE_UNITS).evaluate(snapshots, 100.0)
+
+    assert compat.unit_scores["MAIN"] == three.unit_scores["MAIN"] == 5.0
+    assert compat.unit_scores["SECONDARY"] == pytest.approx(
+        three.unit_scores["SEC_A"] + three.unit_scores["SEC_B"]
+    )
+    # MAIN has the highest single-unit demand in both layouts.
+    assert compat.recommendation.unit_id == three.recommendation.unit_id == "MAIN"
 
 
 def test_green_time_clamps_to_protocol_and_config():
@@ -122,7 +160,27 @@ def test_graceful_degradation_when_all_health_not_required():
         feed(100.0, MAIN={"queue": 12}, SEC_A={"healthy": False}), 100.0
     )
     assert decision.emitted, decision.reasons
-    assert decision.recommendation.movement == "MAIN"
+    assert decision.recommendation.unit_id == "MAIN"
+    assert any("units with unhealthy" in reason for reason in decision.reasons)
+
+
+def test_unit_with_one_blind_camera_is_never_scored_from_partial_data():
+    # SEC_B is blind while SEC_A is very busy. The merged unit must not be
+    # scored from SEC_A alone, because that would treat missing data as traffic
+    # (and, in the other direction, understate the unit).
+    decision_engine = engine(require_all_approaches_healthy=False)
+    decision = decision_engine.evaluate(
+        feed(
+            100.0,
+            MAIN={"queue": 2},
+            SEC_A={"queue": 30},
+            SEC_B={"healthy": False},
+        ),
+        100.0,
+    )
+    assert decision.emitted, decision.reasons
+    assert "SECONDARY" not in decision.unit_scores
+    assert decision.recommendation.unit_id == "MAIN"
 
 
 def test_min_interval_suppresses_repeat_requests():
@@ -146,24 +204,24 @@ def test_material_change_reissues_request():
     # Green would change by more than min_delta_s: allowed again.
     decision = decision_engine.evaluate(feed(110.0, MAIN={"queue": 3}), 110.0)
     assert decision.emitted, decision.reasons
-    assert decision.recommendation.movement == "MAIN"
+    assert decision.recommendation.unit_id == "MAIN"
 
 
-def test_starvation_guard_forces_waiting_group():
+def test_starvation_guard_forces_waiting_unit():
     decision_engine = engine(
         min_interval_s=0,
         min_delta_s=0,
         max_wait_before_force_s=60,
     )
     first = decision_engine.evaluate(feed(0.0, MAIN={"queue": 20}), 0.0)
-    assert first.recommendation.movement == "MAIN"
+    assert first.recommendation.unit_id == "MAIN"
 
     # MAIN stays busiest, but SECONDARY has demand and has waited 61 s.
     decision = decision_engine.evaluate(
         feed(61.0, MAIN={"queue": 20}, SEC_A={"queue": 3}), 61.0
     )
     assert decision.emitted, decision.reasons
-    assert decision.recommendation.movement == "SECONDARY"
+    assert decision.recommendation.unit_id == "SECONDARY"
     assert any("starvation" in reason for reason in decision.reasons)
 
 
@@ -175,25 +233,36 @@ def test_no_starvation_without_demand():
     decision = decision_engine.evaluate(feed(61.0, MAIN={"queue": 20}), 61.0)
     # SECONDARY is idle, so the guard must not invent demand for it.
     assert not any("starvation" in reason for reason in decision.reasons)
-    assert decision.group_scores["MAIN"] > decision.group_scores["SECONDARY"]
+    assert decision.unit_scores["MAIN"] > decision.unit_scores["SECONDARY"]
 
 
-def test_compat_mode_aggregates_secondary_demand_as_sum():
-    summed = engine(aggregation="sum")
+def test_compat_layout_aggregates_secondary_demand_as_sum():
+    summed = engine(COMPAT_UNITS, aggregation="sum")
     decision = summed.evaluate(
         feed(100.0, MAIN={"queue": 5}, SEC_A={"queue": 4}, SEC_B={"queue": 4}),
         100.0,
     )
-    assert decision.group_scores["SECONDARY"] == pytest.approx(8.0)
-    assert decision.recommendation.movement == "SECONDARY"
+    assert decision.unit_scores["SECONDARY"] == pytest.approx(8.0)
+    assert decision.recommendation.unit_id == "SECONDARY"
 
-    maxed = engine(aggregation="max")
+    maxed = engine(COMPAT_UNITS, aggregation="max")
     decision = maxed.evaluate(
         feed(100.0, MAIN={"queue": 5}, SEC_A={"queue": 4}, SEC_B={"queue": 4}),
         100.0,
     )
-    assert decision.group_scores["SECONDARY"] == pytest.approx(4.0)
-    assert decision.recommendation.movement == "MAIN"
+    assert decision.unit_scores["SECONDARY"] == pytest.approx(4.0)
+    assert decision.recommendation.unit_id == "MAIN"
+
+
+def test_three_unit_layout_does_not_aggregate_siblings():
+    decision_engine = engine(THREE_UNITS, aggregation="sum")
+    decision = decision_engine.evaluate(
+        feed(100.0, MAIN={"queue": 1}, SEC_A={"queue": 4}, SEC_B={"queue": 4}),
+        100.0,
+    )
+    assert decision.unit_scores["SEC_A"] == pytest.approx(4.0)
+    assert decision.unit_scores["SEC_B"] == pytest.approx(4.0)
+    assert decision.recommendation.unit_id == "SEC_A"  # tie -> config order
 
 
 def test_smoothing_dampens_single_frame_spike():
@@ -203,7 +272,7 @@ def test_smoothing_dampens_single_frame_spike():
     # A single quiet frame must not immediately look idle after averaging.
     decision = decision_engine.evaluate(feed(now + 0.2, MAIN={"queue": 0}), now + 0.2)
     # 20 and 0 average to 10, still far above the idle threshold.
-    assert decision.group_scores["MAIN"] == pytest.approx(10.0)
+    assert decision.unit_scores["MAIN"] == pytest.approx(10.0)
     assert not any("idle" in reason for reason in decision.reasons)
 
 
@@ -216,6 +285,20 @@ def test_settings_reject_out_of_protocol_green_range():
         DecisionSettings(min_green_s=10, max_green_s=9)
 
 
-def test_unknown_wire_movement_is_rejected():
+def test_engine_rejects_ambiguous_unit_layouts():
     with pytest.raises(ValueError):
-        DecisionEngine({"MAIN": "NORTH"})
+        DecisionEngine([])
+    with pytest.raises(ValueError):
+        DecisionEngine(
+            (
+                ServingUnit("MAIN", ("MAIN",)),
+                ServingUnit("MAIN", ("SEC_A",)),
+            )
+        )
+    with pytest.raises(ValueError):
+        DecisionEngine(
+            (
+                ServingUnit("MAIN", ("MAIN",)),
+                ServingUnit("SECONDARY", ("MAIN", "SEC_A")),
+            )
+        )

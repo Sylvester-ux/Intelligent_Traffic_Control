@@ -30,6 +30,7 @@ from app.config import (
     load_config,
 )
 from app.orchestrator import Orchestrator
+from decision.models import ServingUnit
 from decision.settings import DecisionSettings
 from gateway.client import GatewayConfig
 
@@ -132,7 +133,7 @@ def config_from_source(spec: str) -> AppConfig:
 
     return AppConfig(
         cameras=(camera,),
-        approaches={"MAIN": "MAIN"},
+        units=(ServingUnit("MAIN", ("MAIN",)),),
         decision=DecisionSettings(),
         gateway=GatewayConfig(),
         health=HealthConfig(),

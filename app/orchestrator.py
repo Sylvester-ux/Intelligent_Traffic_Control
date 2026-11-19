@@ -72,7 +72,7 @@ class Orchestrator:
             for camera in config.cameras
         ]
 
-        self.engine = DecisionEngine(config.approaches, config.decision)
+        self.engine = DecisionEngine(config.units, config.decision)
         if gateway is not None:
             self.gateway: Optional[GatewayClient] = gateway
         elif dry_run:
@@ -203,12 +203,12 @@ class Orchestrator:
             return {"sent": False, "reason": "dry_run"}
 
         result: RequestResult = self.gateway.request_green(
-            recommendation.movement, recommendation.green_time
+            recommendation.unit_id, recommendation.green_time
         )
         if result.ok:
             _log.info(
                 "request %s %ss accepted (sequence %s, %s ms)",
-                recommendation.movement,
+                recommendation.unit_id,
                 recommendation.green_time,
                 result.sequence,
                 round(result.latency_s * 1000),
@@ -216,7 +216,7 @@ class Orchestrator:
         else:
             _log.warning(
                 "request %s %ss not accepted: %s (%s)",
-                recommendation.movement,
+                recommendation.unit_id,
                 recommendation.green_time,
                 result.status,
                 result.reason,
@@ -224,7 +224,8 @@ class Orchestrator:
 
         return {
             "sent": True,
-            "movement": recommendation.movement,
+            "unit_id": recommendation.unit_id,
+            "movement": recommendation.unit_id,
             "green_time": recommendation.green_time,
             "priority": "NORMAL",
             "sequence": result.sequence,
@@ -316,12 +317,23 @@ class Orchestrator:
                 approach_id: snapshot.to_log_dict()
                 for approach_id, snapshot in metrics.items()
             },
+            "units": {
+                unit.id: {
+                    "approaches": list(unit.approaches),
+                    "score": (
+                        None
+                        if unit.id not in decision.unit_scores
+                        else round(decision.unit_scores[unit.id], 3)
+                    ),
+                }
+                for unit in self.config.units
+            },
             "decision": {
                 "healthy": decision.healthy,
                 "emitted": decision.emitted,
-                "group_scores": {
-                    movement: round(score, 3)
-                    for movement, score in decision.group_scores.items()
+                "unit_scores": {
+                    unit_id: round(score, 3)
+                    for unit_id, score in decision.unit_scores.items()
                 },
                 "reasons": list(decision.reasons),
             },

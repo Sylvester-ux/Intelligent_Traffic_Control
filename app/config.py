@@ -18,7 +18,7 @@ from camera.base import FrameSource
 from camera.file_source import FileSource
 from camera.rtsp import RtspSource
 from camera.webcam import WebcamSource
-from decision.models import WIRE_MOVEMENTS
+from decision.models import WIRE_MOVEMENTS, ServingUnit
 from decision.settings import DecisionSettings, Weights
 from gateway.client import GatewayConfig
 from pipeline.camera_pipeline import DEFAULT_POLYGON, PipelineConfig
@@ -90,13 +90,12 @@ class LoggingConfig:
 @dataclass(frozen=True)
 class AppConfig:
     cameras: tuple[CameraConfig, ...]
-    approaches: dict[str, str]
+    units: tuple[ServingUnit, ...]
     decision: DecisionSettings
     gateway: GatewayConfig
     health: HealthConfig
     logging: LoggingConfig
     detection: DetectionConfig = field(default_factory=DetectionConfig)
-    phase_mode: str = "two_phase_compat"
     display: bool = False
 
     @property
@@ -150,23 +149,19 @@ def build_config(raw: Mapping[str, Any], *, base_dir: Optional[Path] = None) -> 
     if len(set(ids)) != len(ids):
         raise ConfigError(f"camera ids must be unique, got {ids}")
 
-    approaches_raw = raw.get("approaches")
-    if not isinstance(approaches_raw, dict) or not approaches_raw:
-        raise ConfigError("'approaches' must map approach ids to wire movements")
-    approaches = {str(key): str(value) for key, value in approaches_raw.items()}
-    for approach_id, movement in approaches.items():
-        if movement not in WIRE_MOVEMENTS:
-            raise ConfigError(
-                f"approach {approach_id!r} maps to unknown movement {movement!r}"
-            )
+    if "approaches" in raw:
+        raise ConfigError(
+            "'approaches' is no longer supported; assign approaches to serving "
+            "units under decision.units"
+        )
+    if "phase_mode" in raw:
+        raise ConfigError(
+            "'phase_mode' was replaced by gateway.mode "
+            "(compat_two_phase | three_phase)"
+        )
 
     approach_owners: dict[str, str] = {}
     for camera in cameras:
-        if camera.approach not in approaches:
-            raise ConfigError(
-                f"camera {camera.id!r} uses approach {camera.approach!r} "
-                "which is missing from 'approaches'"
-            )
         if camera.approach in approach_owners:
             raise ConfigError(
                 f"approach {camera.approach!r} has two cameras "
@@ -178,7 +173,9 @@ def build_config(raw: Mapping[str, Any], *, base_dir: Optional[Path] = None) -> 
     decision_raw = raw.get("decision") or {}
     if not isinstance(decision_raw, dict):
         raise ConfigError("'decision' must be a mapping")
-    decision = _decision_settings(decision_raw, approaches)
+    units = _units_from(decision_raw.get("units"))
+    _validate_units(units, set(approach_owners))
+    decision = _decision_settings(decision_raw)
 
     gateway_raw = raw.get("gateway") or {}
     if not isinstance(gateway_raw, dict):
@@ -194,24 +191,16 @@ def build_config(raw: Mapping[str, Any], *, base_dir: Optional[Path] = None) -> 
     detection_raw = raw.get("detection") or {}
     detection = _build(DetectionConfig, detection_raw, "detection")
 
-    phase_mode = str(raw.get("phase_mode", "two_phase_compat"))
-    if phase_mode != "two_phase_compat":
-        raise ConfigError(
-            "only 'two_phase_compat' is supported; three-phase control needs a "
-            "firmware/protocol change"
-        )
-
     display = bool(raw.get("display", False))
 
     return AppConfig(
         cameras=tuple(cameras),
-        approaches=approaches,
+        units=units,
         decision=decision,
         gateway=gateway,
         health=health,
         logging=logging_config,
         detection=detection,
-        phase_mode=phase_mode,
         display=display,
     )
 
@@ -317,9 +306,81 @@ def _polygon(value: Any, camera_id: str) -> tuple[tuple[float, float], ...]:
     return tuple(points)
 
 
-def _decision_settings(
-    raw: Mapping[str, Any], approaches: Mapping[str, str]
-) -> DecisionSettings:
+def _units_from(value: Any) -> tuple[ServingUnit, ...]:
+    """Parse ``decision.units``: the engine's serving layout."""
+    if not isinstance(value, list) or not value:
+        raise ConfigError("decision.units must be a non-empty list")
+
+    units: list[ServingUnit] = []
+    for entry in value:
+        if not isinstance(entry, dict):
+            raise ConfigError("each decision.units entry must be a mapping")
+        unknown = set(entry) - {"id", "approaches"}
+        if unknown:
+            raise ConfigError(
+                f"unknown decision.units keys: {sorted(unknown)}"
+            )
+        unit_id = entry.get("id")
+        approaches = entry.get("approaches")
+        if not isinstance(unit_id, str) or not unit_id:
+            raise ConfigError("each decision unit needs a non-empty string 'id'")
+        if not isinstance(approaches, list) or not approaches:
+            raise ConfigError(
+                f"decision unit {unit_id!r} needs a non-empty 'approaches' list"
+            )
+        if not all(isinstance(item, str) and item for item in approaches):
+            raise ConfigError(
+                f"decision unit {unit_id!r} approaches must be non-empty strings"
+            )
+        units.append(ServingUnit(unit_id, tuple(approaches)))
+
+    ids = [unit.id for unit in units]
+    if len(set(ids)) != len(ids):
+        raise ConfigError(f"serving unit ids must be unique, got {ids}")
+
+    assigned: dict[str, str] = {}
+    for unit in units:
+        for approach_id in unit.approaches:
+            if approach_id in assigned:
+                raise ConfigError(
+                    f"approach {approach_id!r} is assigned to both "
+                    f"{assigned[approach_id]!r} and {unit.id!r}"
+                )
+            assigned[approach_id] = unit.id
+
+    return tuple(units)
+
+
+def _validate_units(
+    units: tuple[ServingUnit, ...], camera_approaches: set[str]
+) -> None:
+    """Every camera approach must be in exactly one unit, and vice versa."""
+    unit_approaches = {
+        approach_id for unit in units for approach_id in unit.approaches
+    }
+    missing = sorted(camera_approaches - unit_approaches)
+    if missing:
+        raise ConfigError(
+            "camera approaches missing from decision.units: " + ", ".join(missing)
+        )
+    orphaned = sorted(unit_approaches - camera_approaches)
+    if orphaned:
+        raise ConfigError(
+            "decision.units reference approaches with no camera: "
+            + ", ".join(orphaned)
+        )
+
+    # This build speaks the current two-phase protocol: the unit id is the
+    # wire movement until the protocol adapter lands.
+    for unit in units:
+        if unit.id not in WIRE_MOVEMENTS:
+            raise ConfigError(
+                f"serving unit {unit.id!r} is not a wire movement; this build "
+                f"supports the two-phase layout {WIRE_MOVEMENTS}"
+            )
+
+
+def _decision_settings(raw: Mapping[str, Any]) -> DecisionSettings:
     allowed = {
         "weights",
         "base_green_s",
@@ -335,6 +396,7 @@ def _decision_settings(
         "idle_score_threshold",
         "aggregation",
         "require_all_approaches_healthy",
+        "units",
     }
     unknown = set(raw) - allowed
     if unknown:
@@ -351,7 +413,7 @@ def _decision_settings(
         "weights": weights,
         "aggregation": aggregation,
     }
-    for key in allowed - {"weights", "aggregation"}:
+    for key in allowed - {"weights", "aggregation", "units"}:
         if key in raw:
             kwargs[key] = raw[key]
 

@@ -52,16 +52,16 @@ cameras:
   #   index: 0
   #   flip: true
 
-# Two-phase compatibility mode: the firmware only knows MAIN and SECONDARY.
-# SEC_A and SEC_B are reported separately but share the SECONDARY movement.
-approaches:
-  MAIN: MAIN
-  SEC_A: SECONDARY
-  SEC_B: SECONDARY
-
-phase_mode: two_phase_compat
-
 decision:
+  # Serving units: what the engine allocates green to. The current firmware
+  # speaks only MAIN and SECONDARY, so SEC_A and SEC_B share the SECONDARY
+  # unit in this compat layout. See the three-phase layout in the README.
+  units:
+    - id: MAIN
+      approaches: [MAIN]
+    - id: SECONDARY
+      approaches: [SEC_A, SEC_B]
+
   weights:
     queue: 1.0        # per vehicle inside the road region
     stationary: 1.5   # per stopped vehicle

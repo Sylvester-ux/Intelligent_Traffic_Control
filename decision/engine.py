@@ -3,10 +3,11 @@
 Pure logic: no I/O, no clocks (``now`` is always supplied), no threads. The
 orchestrator feeds it :class:`ApproachMetrics` and writes whatever it returns.
 
-Two-phase compatibility mode is a configuration concern, not an engine special
-case: approaches are mapped to wire movements (``SEC_A`` and ``SEC_B`` both map
-to ``SECONDARY``) and the engine groups them, so a future three-phase mode is a
-mapping change plus a protocol adapter.
+The engine allocates green to **serving units**, never to wire movements. A
+unit is one or more named approaches; the layout comes from configuration
+(three units for a three-phase T junction, two units with ``SEC_A``/``SEC_B``
+merged for the current two-phase firmware). Nothing here knows or validates the
+wire protocol names -- that is the protocol adapter's job at the edge.
 """
 
 from __future__ import annotations
@@ -14,12 +15,13 @@ from __future__ import annotations
 import logging
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Iterable, Mapping, Optional
+from typing import Iterable, Mapping, Optional, Sequence
 
 from decision.models import (
     CONGESTION_WEIGHTS,
     ApproachMetrics,
     Recommendation,
+    ServingUnit,
 )
 from decision.settings import DecisionSettings, Weights
 
@@ -32,7 +34,7 @@ class Decision:
 
     recommendation: Optional[Recommendation]
     reasons: tuple[str, ...]
-    group_scores: Mapping[str, float]
+    unit_scores: Mapping[str, float]
     healthy: bool
 
     @property
@@ -55,43 +57,48 @@ class DecisionEngine:
 
     def __init__(
         self,
-        approaches: Mapping[str, str],
+        units: Sequence[ServingUnit],
         settings: Optional[DecisionSettings] = None,
     ) -> None:
-        if not approaches:
-            raise ValueError("at least one approach must be configured")
-        for approach_id, movement in approaches.items():
-            if movement not in ("MAIN", "SECONDARY"):
-                raise ValueError(
-                    f"approach {approach_id!r} maps to unknown movement {movement!r}"
-                )
-        self.approaches: dict[str, str] = dict(approaches)
+        if not units:
+            raise ValueError("at least one serving unit must be configured")
+
+        self.units: dict[str, tuple[str, ...]] = {}
+        seen: set[str] = set()
+        for unit in units:
+            if unit.id in self.units:
+                raise ValueError(f"duplicate serving unit {unit.id!r}")
+            for approach_id in unit.approaches:
+                if approach_id in seen:
+                    raise ValueError(
+                        f"approach {approach_id!r} is assigned to more than one "
+                        "serving unit"
+                    )
+                seen.add(approach_id)
+            self.units[unit.id] = tuple(unit.approaches)
+
+        self.approach_ids: tuple[str, ...] = tuple(seen)
         self.settings = settings or DecisionSettings()
 
-        # wire movement -> approach ids, preserving config order
-        self.groups: dict[str, list[str]] = {}
-        for approach_id, movement in self.approaches.items():
-            self.groups.setdefault(movement, []).append(approach_id)
-
         self._samples: dict[str, deque[_Sample]] = {
-            approach_id: deque() for approach_id in self.approaches
+            approach_id: deque() for approach_id in self.approach_ids
         }
         self._started_at: Optional[float] = None
         self._last_served: dict[str, float] = {}
         self._last_request_at: Optional[float] = None
         self._last_green: Optional[int] = None
-        self._last_movement: Optional[str] = None
+        self._last_unit: Optional[str] = None
 
     # -- public -----------------------------------------------------------
 
     def evaluate(
         self, metrics: Mapping[str, ApproachMetrics], now: float
     ) -> Decision:
-        """Score groups and return a decision for this instant."""
+        """Score units and return a decision for this instant."""
         if self._started_at is None:
             self._started_at = now
-            for movement in self.groups:
-                self._last_served[movement] = now
+            for unit_id in self.units:
+                self._last_served[unit_id] = now
 
         healthy_ids, unhealthy_ids = self._classify_health(metrics, now)
         reasons: list[str] = []
@@ -108,6 +115,7 @@ class DecisionEngine:
             reasons.append("no healthy approaches")
             return Decision(None, tuple(reasons), {}, healthy=False)
 
+        healthy_set = set(healthy_ids)
         smoothed = {
             approach_id: self._smooth(metrics[approach_id], now)
             for approach_id in healthy_ids
@@ -115,26 +123,34 @@ class DecisionEngine:
 
         scores: dict[str, float] = {}
         details: list[str] = []
-        for movement, approach_ids in self.groups.items():
-            usable = [aid for aid in approach_ids if aid in smoothed]
-            if not usable:
+        skipped: list[str] = []
+        for unit_id, approach_ids in self.units.items():
+            # Even in the degraded policy a unit is never scored from a subset
+            # of its members: missing data is not zero traffic.
+            if any(approach_id not in healthy_set for approach_id in approach_ids):
+                skipped.append(unit_id)
                 continue
-            score, breakdown = self._score_group(usable, smoothed)
-            scores[movement] = round(score, 3)
-            details.append(f"{movement}={score:.2f} ({breakdown})")
+            score, breakdown = self._score_unit(approach_ids, smoothed)
+            scores[unit_id] = round(score, 3)
+            details.append(f"{unit_id}={score:.2f} ({breakdown})")
+
+        if skipped:
+            reasons.append(
+                "units with unhealthy approaches: " + ", ".join(skipped)
+            )
 
         if not scores:
-            reasons.append("no scored groups")
+            reasons.append("no scored units")
             return Decision(None, tuple(reasons), {}, healthy=False)
 
         if max(scores.values()) < self.settings.idle_score_threshold:
             reasons.append(
-                f"idle: all group scores below {self.settings.idle_score_threshold}"
+                f"idle: all unit scores below {self.settings.idle_score_threshold}"
             )
             return Decision(None, tuple(reasons), scores, healthy=True)
 
         winner, forced = self._choose_winner(scores, now)
-        forced = forced and winner != self._last_movement
+        forced = forced and winner != self._last_unit
         if forced:
             reasons.append(
                 f"starvation guard: {winner} waited more than "
@@ -152,7 +168,7 @@ class DecisionEngine:
 
         reasons.append(f"recommend {winner} green {green_time}s (advisory only)")
         recommendation = Recommendation(
-            movement=winner,
+            unit_id=winner,
             green_time=green_time,
             priority="NORMAL",
             reasons=tuple(reasons),
@@ -164,7 +180,7 @@ class DecisionEngine:
         return Decision(
             recommendation=recommendation,
             reasons=tuple(reasons),
-            group_scores=scores,
+            unit_scores=scores,
             healthy=True,
         )
 
@@ -176,7 +192,7 @@ class DecisionEngine:
         self._last_served.clear()
         self._last_request_at = None
         self._last_green = None
-        self._last_movement = None
+        self._last_unit = None
 
     # -- health -----------------------------------------------------------
 
@@ -186,7 +202,7 @@ class DecisionEngine:
         healthy: list[str] = []
         unhealthy: list[str] = []
 
-        for approach_id in self.approaches:
+        for approach_id in self.approach_ids:
             snapshot = metrics.get(approach_id)
             if snapshot is None:
                 unhealthy.append(approach_id)
@@ -232,7 +248,7 @@ class DecisionEngine:
             congestion=sum(item.congestion for item in queue) / count,
         )
 
-    def _score_group(
+    def _score_unit(
         self, approach_ids: Iterable[str], smoothed: Mapping[str, _Sample]
     ) -> tuple[float, str]:
         samples = [smoothed[approach_id] for approach_id in approach_ids]
@@ -242,7 +258,7 @@ class DecisionEngine:
         queue = aggregate([sample.queue for sample in samples])
         stationary = aggregate([sample.stationary for sample in samples])
         congestion = aggregate([sample.congestion for sample in samples])
-        # Waiting is a max-of-group signal: one long-waiting approach matters
+        # Waiting is a max-of-unit signal: one long-waiting approach matters
         # even when the others are empty.
         wait = max(sample.wait for sample in samples)
 
@@ -267,30 +283,30 @@ class DecisionEngine:
     def _choose_winner(
         self, scores: Mapping[str, float], now: float
     ) -> tuple[str, bool]:
-        """Highest score, unless a starving group with demand must go first."""
+        """Highest score, unless a starving unit with demand must go first."""
         starving = [
-            movement
-            for movement, score in scores.items()
+            unit_id
+            for unit_id, score in scores.items()
             if score >= self.settings.idle_score_threshold
-            and now - self._last_served.get(movement, now)
+            and now - self._last_served.get(unit_id, now)
             > self.settings.max_wait_before_force_s
         ]
         if starving:
-            # Deterministic: longest wait wins; the group that was just served
+            # Deterministic: longest wait wins; the unit that was just served
             # loses ties so one busy approach cannot monopolise the junction.
             starving.sort(
-                key=lambda movement: (
-                    self._last_served.get(movement, now),
-                    movement == self._last_movement,
-                    list(self.groups).index(movement),
+                key=lambda unit_id: (
+                    self._last_served.get(unit_id, now),
+                    unit_id == self._last_unit,
+                    list(self.units).index(unit_id),
                 )
             )
             return starving[0], True
 
-        # Deterministic tie-break on configured group order.
+        # Deterministic tie-break on configured unit order.
         winner = max(
             scores,
-            key=lambda movement: (scores[movement], -list(self.groups).index(movement)),
+            key=lambda unit_id: (scores[unit_id], -list(self.units).index(unit_id)),
         )
         return winner, False
 
@@ -309,7 +325,7 @@ class DecisionEngine:
         return clamped, note
 
     def _change_gate(
-        self, movement: str, green_time: int, now: float
+        self, unit_id: str, green_time: int, now: float
     ) -> Optional[str]:
         if self._last_request_at is None:
             return None
@@ -320,18 +336,18 @@ class DecisionEngine:
                 f"(min interval {self.settings.min_interval_s:.0f}s)"
             )
         if (
-            movement == self._last_movement
+            unit_id == self._last_unit
             and self._last_green is not None
             and abs(green_time - self._last_green) <= self.settings.min_delta_s
         ):
             return (
-                f"suppressed: {movement} green unchanged within "
+                f"suppressed: {unit_id} green unchanged within "
                 f"{self.settings.min_delta_s}s"
             )
         return None
 
-    def _record_emission(self, movement: str, green_time: int, now: float) -> None:
+    def _record_emission(self, unit_id: str, green_time: int, now: float) -> None:
         self._last_request_at = now
         self._last_green = green_time
-        self._last_movement = movement
-        self._last_served[movement] = now
+        self._last_unit = unit_id
+        self._last_served[unit_id] = now

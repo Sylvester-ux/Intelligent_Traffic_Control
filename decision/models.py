@@ -12,7 +12,7 @@ from typing import Mapping
 # Congestion contributes to demand on this scale.
 CONGESTION_WEIGHTS: dict[str, float] = {"Low": 0.0, "Moderate": 1.0, "High": 2.0}
 
-#: Movements that exist on the wire. No other value may ever be sent.
+#: Movements the current firmware accepts. No other value is sent by default.
 WIRE_MOVEMENTS: tuple[str, ...] = ("MAIN", "SECONDARY")
 
 #: Hard protocol range for ``green_time``.
@@ -77,10 +77,39 @@ class ApproachMetrics:
 
 
 @dataclass(frozen=True)
+class ServingUnit:
+    """The thing green time is allocated to: one or more approaches.
+
+    A unit is a decision-engine concept only. Whether its id is also a wire
+    movement is decided by the protocol adapter, not by the engine.
+    """
+
+    id: str
+    approaches: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not self.id:
+            raise ValueError("a serving unit needs a non-empty id")
+        if not self.approaches:
+            raise ValueError(f"serving unit {self.id!r} has no approaches")
+
+    @classmethod
+    def from_config(cls, entry: Mapping) -> "ServingUnit":
+        """Build from a validated config entry (``{id, approaches}``)."""
+        return cls(
+            id=str(entry["id"]),
+            approaches=tuple(str(item) for item in entry["approaches"]),
+        )
+
+    def to_log_dict(self) -> dict:
+        return {"id": self.id, "approaches": list(self.approaches)}
+
+
+@dataclass(frozen=True)
 class Recommendation:
     """A green-time recommendation. Advisory only: never a phase change."""
 
-    movement: str
+    unit_id: str
     green_time: int
     priority: str = "NORMAL"
     reasons: tuple[str, ...] = field(default_factory=tuple)
@@ -88,7 +117,7 @@ class Recommendation:
 
     def to_log_dict(self) -> dict:
         return {
-            "movement": self.movement,
+            "unit_id": self.unit_id,
             "green_time": self.green_time,
             "priority": self.priority,
             "reasons": list(self.reasons),

@@ -64,12 +64,11 @@ def test_three_cameras_to_mock_gateway(make_video, tmp_path):
                 _camera("cam_sec_a", "SEC_A", sec_a_clip),
                 _camera("cam_sec_b", "SEC_B", sec_b_clip),
             ],
-            "approaches": {
-                "MAIN": "MAIN",
-                "SEC_A": "SECONDARY",
-                "SEC_B": "SECONDARY",
-            },
             "decision": {
+                "units": [
+                    {"id": "MAIN", "approaches": ["MAIN"]},
+                    {"id": "SECONDARY", "approaches": ["SEC_A", "SEC_B"]},
+                ],
                 "smoothing_window_s": 0,
                 "min_interval_s": 0,
                 "min_delta_s": 0,
@@ -117,8 +116,12 @@ def test_three_cameras_to_mock_gateway(make_video, tmp_path):
     assert len(entries) >= 5
     for entry in entries:
         assert set(entry["approaches"]) == {"MAIN", "SEC_A", "SEC_B"}
+        assert set(entry["units"]) == {"MAIN", "SECONDARY"}
+        assert set(entry["decision"]["unit_scores"]) <= set(entry["units"])
         assert entry["decision"]["reasons"]
         assert set(entry["cameras"]) == {"cam_main", "cam_sec_a", "cam_sec_b"}
+        if entry["recommendation"] is not None:
+            assert entry["recommendation"]["unit_id"] in entry["units"]
 
     accepted = [
         entry
