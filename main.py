@@ -58,6 +58,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="never open a window (overrides --display and config display)",
     )
     parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="open the optional operator console (PySide6)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="decide and log but do not connect to a gateway",
@@ -181,6 +186,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "--movements MAIN,SECONDARY_A,SECONDARY_B or it will reject "
                 "the proposed names"
             )
+
+    if args.gui:
+        if args.headless:
+            _log.error("--gui and --headless are mutually exclusive")
+            return 2
+        if args.display:
+            _log.warning("--display is ignored with --gui; the console shows frames")
+        from app.controller import AppController
+        from ui.app import run_gui
+
+        controller = AppController(
+            config,
+            config_path=None if args.source else args.config,
+            dry_run=args.dry_run,
+            mock_gateway=args.mock_gateway,
+            display=False,
+            annotate_frames=True,
+        )
+        return run_gui(controller, argv=sys.argv[:1])
 
     display = (args.display or config.display) and not args.headless
     orchestrator = Orchestrator(config, display=display, dry_run=args.dry_run)

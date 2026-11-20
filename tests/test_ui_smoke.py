@@ -1,0 +1,122 @@
+"""Offscreen smoke tests for the console shell (no display server needed)."""
+
+from __future__ import annotations
+
+import os
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import pytest
+from PySide6.QtCore import QSettings
+from PySide6.QtWidgets import QApplication
+
+from app.config import build_config
+from app.controller import AppController
+from ui.dialogs import build_confirm
+from ui.main_window import MainWindow
+
+
+@pytest.fixture(scope="session")
+def qt_app():
+    app = QApplication.instance() or QApplication([])
+    yield app
+
+
+def _config():
+    return build_config(
+        {
+            "cameras": [
+                {
+                    "id": "cam_main",
+                    "approach": "MAIN",
+                    "source": "file",
+                    "path": "missing.avi",
+                },
+                {
+                    "id": "cam_sec_a",
+                    "approach": "SEC_A",
+                    "source": "file",
+                    "path": "missing_a.avi",
+                },
+                {
+                    "id": "cam_sec_b",
+                    "approach": "SEC_B",
+                    "source": "file",
+                    "path": "missing_b.avi",
+                },
+            ],
+            "decision": {
+                "units": [
+                    {"id": "MAIN", "approaches": ["MAIN"]},
+                    {"id": "SECONDARY", "approaches": ["SEC_A", "SEC_B"]},
+                ]
+            },
+            "logging": {"decision_log": "logs/decisions.jsonl"},
+        }
+    )
+
+
+def _window(qt_app, tmp_path):
+    settings = QSettings(str(tmp_path / "ui.ini"), QSettings.Format.IniFormat)
+    controller = AppController(_config(), dry_run=True)
+    window = MainWindow(controller, settings=settings, theme_name="dark")
+    window.show()
+    qt_app.processEvents()
+    return controller, window
+
+
+def test_shell_builds_with_menus_tiles_and_chips(qt_app, tmp_path):
+    controller, window = _window(qt_app, tmp_path)
+    try:
+        titles = [action.text() for action in window.menuBar().actions()]
+        assert titles == ["File", "View", "Cameras", "Log", "Settings", "Help"]
+        assert window.windowTitle() == "Smarti AI Host — Traffic Control Console"
+        assert set(window._tiles) == {"cam_main", "cam_sec_a", "cam_sec_b"}
+        assert window.camera_chip.text.text() == "0/3 cameras"
+        assert window.dry_chip.isVisible()
+        assert window.mode_badge.text() == "SIMULATION"
+        assert window.start_button.text() == "START"
+        assert window.playback_section.isVisible()
+    finally:
+        window.close()
+        controller.shutdown()
+
+
+def test_theme_switch_changes_stylesheet(qt_app, tmp_path):
+    controller, window = _window(qt_app, tmp_path)
+    try:
+        window.switch_theme("light")
+        assert window.theme.name == "light"
+        assert "#EEF2F5" in QApplication.instance().styleSheet()
+        window.switch_theme("dark")
+        assert "#222B38" in QApplication.instance().styleSheet()
+    finally:
+        window.close()
+        controller.shutdown()
+
+
+def test_consequence_dialogs_default_to_cancel(qt_app):
+    box = build_confirm(
+        None,
+        "Reset analysis?",
+        "Restart analysis state?",
+        confirm_label="Reset",
+    )
+    try:
+        assert box.defaultButton().text() == "Cancel"
+        assert box.escapeButton().text() == "Cancel"
+    finally:
+        box.deleteLater()
+
+
+def test_sidebar_sections_collapse_and_persist(qt_app, tmp_path):
+    controller, window = _window(qt_app, tmp_path)
+    try:
+        window.controls_section.set_expanded(False)
+        assert not window.controls_section.is_expanded()
+        assert not window.controls_section.body.isVisible()
+        window.controls_section.set_expanded(True)
+        assert window.controls_section.body.isVisible()
+    finally:
+        window.close()
+        controller.shutdown()
