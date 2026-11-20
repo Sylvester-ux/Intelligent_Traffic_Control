@@ -41,6 +41,7 @@ from app.controller import AppController
 from app.exporters import config_yaml
 from app.snapshots import UiSnapshot
 from ui.dialogs import about_text, confirm
+from ui.logs import LogPanel
 from ui.schematic import SchematicTile
 from ui.theme import DARK, THEMES, stylesheet
 from ui.tiles import CameraTile
@@ -65,6 +66,9 @@ class MainWindow(QMainWindow):
         stored_theme = theme_name or str(self.settings.value("theme", "dark"))
         self.theme = THEMES.get(stored_theme, DARK)
         self._snapshot: UiSnapshot | None = None
+        self._log_seq = 0
+        self._event_seq = 0
+        self._events_by_seq: dict[int, object] = {}
         self._focused_camera: str | None = None
         self._focus_mode = False
         self._playback_paused = False
@@ -128,6 +132,9 @@ class MainWindow(QMainWindow):
 
         self.open_logs_action = QAction("Open logs folder", self)
         self.open_logs_action.triggered.connect(self._open_logs_folder)
+
+        self.live_log_action = QAction("Live log", self)
+        self.live_log_action.triggered.connect(self._show_log_tab)
 
         self.open_config_action = QAction("View configuration…", self)
         self.open_config_action.triggered.connect(self._open_config)
@@ -209,6 +216,8 @@ class MainWindow(QMainWindow):
             cameras_menu.addAction(action)
 
         log_menu = menu.addMenu("Log")
+        log_menu.addAction(self.logs_action)
+        log_menu.addAction(self.live_log_action)
         log_menu.addAction(self.open_logs_action)
 
         settings_menu = menu.addMenu("Settings")
@@ -242,10 +251,12 @@ class MainWindow(QMainWindow):
 
         self.log_dock = QFrame()
         self.log_dock.setObjectName("card")
-        self.log_dock.setMinimumHeight(120)
+        self.log_dock.setMinimumHeight(150)
+        self.log_dock.setMaximumHeight(280)
         dock_layout = QVBoxLayout(self.log_dock)
-        dock_layout.setContentsMargins(10, 6, 10, 6)
-        dock_layout.addWidget(QLabel("Live log and decisions arrive with the log panel."))
+        dock_layout.setContentsMargins(4, 4, 4, 4)
+        self.log_panel = LogPanel(self.theme)
+        dock_layout.addWidget(self.log_panel)
         layout.addWidget(self.log_dock, 0)
         return holder
 
@@ -321,9 +332,18 @@ class MainWindow(QMainWindow):
             QTableWidget.SelectionBehavior.SelectRows
         )
         self.events_table.setMinimumHeight(140)
+        self.events_table.cellClicked.connect(self._event_clicked)
+        events_box = QWidget()
+        events_layout = QVBoxLayout(events_box)
+        events_layout.setContentsMargins(0, 0, 0, 4)
+        events_layout.setSpacing(2)
+        events_layout.addWidget(self.events_table)
+        view_log = QPushButton("View full log")
+        view_log.clicked.connect(self._show_log_tab)
+        events_layout.addWidget(view_log)
         layout.addWidget(
             CollapsibleSection(
-                "Live Events", self.events_table, settings=self.settings, key="events"
+                "Live Events", events_box, settings=self.settings, key="events"
             )
         )
 
@@ -441,6 +461,7 @@ class MainWindow(QMainWindow):
             tile.theme = self.theme
             tile.update()
         self.schematic_tile.set_theme(self.theme)
+        self.log_panel.set_theme(self.theme)
         self._refresh_status()
 
     def _theme_toggled(self, light: bool) -> None:
@@ -493,6 +514,11 @@ class MainWindow(QMainWindow):
     def _set_logs_visible(self, visible: bool) -> None:
         self.log_dock.setVisible(bool(visible))
         self.settings.setValue("view/logs", bool(visible))
+
+    def _show_log_tab(self) -> None:
+        self.logs_action.setChecked(True)
+        self.log_dock.setVisible(True)
+        self.log_panel.setCurrentWidget(self.log_panel.live)
 
     def _restore_layout(self) -> None:
         geometry = self.settings.value("window/geometry")
@@ -554,12 +580,47 @@ class MainWindow(QMainWindow):
                 tile.set_frame(frame)
 
     def _refresh_panels(self) -> None:
+        lines, self._log_seq = self.controller.log_lines(self._log_seq)
+        if lines:
+            self.log_panel.append_logs(lines)
+        self.log_panel.set_decisions(self.controller.decisions())
         self._refresh_status()
         self._refresh_events()
 
     def _refresh_events(self) -> None:
-        # Filled by the log panel phase; keeping the table selection intact.
-        return
+        events, self._event_seq = self.controller.events(self._event_seq)
+        for event in events:
+            self._events_by_seq[event.seq] = event
+            self.events_table.insertRow(0)
+            values = [
+                datetime.fromtimestamp(event.ts).strftime("%H:%M:%S"),
+                event.subject,
+                event.action,
+                event.result,
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setData(Qt.ItemDataRole.UserRole, event.seq)
+                self.events_table.setItem(0, column, item)
+        while self.events_table.rowCount() > 200:
+            self.events_table.removeRow(self.events_table.rowCount() - 1)
+        while len(self._events_by_seq) > 500:
+            self._events_by_seq.pop(min(self._events_by_seq), None)
+
+    def _event_clicked(self, row: int, _column: int) -> None:
+        item = self.events_table.item(row, 0)
+        if item is None:
+            return
+        seq = item.data(Qt.ItemDataRole.UserRole)
+        event = self._events_by_seq.get(seq)
+        if event is None or event.kind != "decision":
+            return
+        timestamp = event.detail.get("ts")
+        if not timestamp:
+            return
+        self._show_log_tab()
+        self.log_panel.setCurrentWidget(self.log_panel.decisions)
+        self.log_panel.decisions.select_ts(str(timestamp))
 
     def _refresh_status(self) -> None:
         snapshot = self.controller.snapshot()

@@ -474,6 +474,7 @@ class AppController:
                 str(recommendation.get("unit_id", "")),
                 f"recommend {recommendation.get('green_time', '?')}s",
                 str(status),
+                {"ts": entry.get("ts")},
             )
 
         cameras = entry.get("cameras") or {}
