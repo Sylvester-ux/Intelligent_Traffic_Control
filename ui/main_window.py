@@ -41,11 +41,11 @@ from app.controller import AppController
 from app.exporters import config_yaml
 from app.snapshots import UiSnapshot
 from ui.dialogs import about_text, confirm
+from ui.schematic import SchematicTile
 from ui.theme import DARK, THEMES, stylesheet
 from ui.tiles import CameraTile
 from ui.widgets import (
     CollapsibleSection,
-    EmptyTile,
     StatusChip,
     format_uptime,
 )
@@ -250,8 +250,11 @@ class MainWindow(QMainWindow):
         return holder
 
     def _build_tiles(self) -> None:
-        self.schematic_tile = EmptyTile(
-            "T-JUNCTION   schematic", "Recommendation (advisory)"
+        self.schematic_tile = SchematicTile(
+            theme=self.theme,
+            approaches=tuple(
+                camera.approach for camera in self.controller.config.cameras
+            ),
         )
         for camera in self.controller.config.cameras:
             tile = CameraTile(
@@ -437,6 +440,7 @@ class MainWindow(QMainWindow):
         for tile in self._tiles.values():
             tile.theme = self.theme
             tile.update()
+        self.schematic_tile.set_theme(self.theme)
         self._refresh_status()
 
     def _theme_toggled(self, light: bool) -> None:
@@ -650,6 +654,7 @@ class MainWindow(QMainWindow):
                     snapshot.approach(camera.approach),
                     started=snapshot.started,
                 )
+        self.schematic_tile.set_snapshot(snapshot)
 
     # -- commands ----------------------------------------------------------
 

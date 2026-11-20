@@ -169,6 +169,9 @@ QLabel#largeReadout {
     font-weight: 600;
     font-variant-numeric: tabular-nums;
 }
+QLabel#largeReadout[tone="ok"] { color: {{status-ok}}; }
+QLabel#largeReadout[tone="warn"] { color: {{status-warn}}; }
+QLabel#largeReadout[tone="critical"] { color: {{status-critical-text}}; }
 QLabel#mono {
     font-family: {{mono-font}};
     color: {{text-secondary}};

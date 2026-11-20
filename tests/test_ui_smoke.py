@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -13,6 +14,7 @@ from PySide6.QtWidgets import QApplication
 
 from app.config import build_config
 from app.controller import AppController
+from app.snapshots import RecommendationView, frozen_mapping
 from ui.dialogs import build_confirm
 from ui.main_window import MainWindow
 from ui.theme import DARK
@@ -127,6 +129,38 @@ def test_camera_tile_tracks_health_and_paints(qt_app):
 
     tile.set_health("LIVE", 0.0, None, 0, started=False)
     assert tile.status_word() == "STOPPED"
+
+
+def test_schematic_is_labelled_advisory_and_shows_units(qt_app, tmp_path):
+    controller, window = _window(qt_app, tmp_path)
+    try:
+        tile = window.schematic_tile
+        assert set(tile.cards) == {"MAIN", "SEC_A", "SEC_B"}
+        assert "ADVISORY" in tile.advisory.text()
+
+        snapshot = controller.snapshot()
+        snapshot = replace(
+            snapshot,
+            recommendation=RecommendationView(
+                unit_id="MAIN",
+                wire_movement="MAIN",
+                green_time=15,
+                reasons=("busy main road",),
+                expected_red_s=frozen_mapping({"MAIN": 12.0}),
+                sent=True,
+                request_status="CONTROLLER_ACCEPTED",
+                accepted=True,
+            ),
+            expected_red_s=frozen_mapping({"MAIN": 12.0, "SECONDARY": 22.0}),
+            decision_reasons=("busy main road",),
+        )
+        tile.set_snapshot(snapshot)
+        assert "MAIN 15s" in tile.advisory.text()
+        assert "MAIN" in tile.red_label.text()
+        assert "busy main road" in tile.reasons.toPlainText()
+    finally:
+        window.close()
+        controller.shutdown()
 
 
 def test_sidebar_sections_collapse_and_persist(qt_app, tmp_path):
