@@ -148,6 +148,13 @@ class GatewayClient:
     def next_sequence(self) -> int:
         return self._next_sequence
 
+    def restart_session(self) -> None:
+        """Drop the current session; the supervisor reconnects and sequence resets."""
+        if self._session_ready.is_set():
+            self._on_session_lost("operator reset")
+        else:
+            self._next_sequence = 1
+
     # -- requests ---------------------------------------------------------
 
     def request_green(

@@ -102,6 +102,9 @@ class CameraPipeline:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._period = 1.0 / max(0.1, self.config.target_fps)
+        self._show_polygon = True
+        self._show_count_line = True
+        self._reset_requested = threading.Event()
 
     # -- lifecycle --------------------------------------------------------
 
@@ -230,15 +233,65 @@ class CameraPipeline:
 
         return base.with_health(healthy, age if age is not None else 0.0)
 
-    def latest_annotated(self) -> Optional[np.ndarray]:
+    def latest_annotated(self, max_size: Optional[int] = None) -> Optional[np.ndarray]:
+        """Copy the annotated frame, optionally downscaled for a GUI tile."""
         with self._lock:
-            return None if self._annotated is None else self._annotated.copy()
+            frame = None if self._annotated is None else self._annotated.copy()
+        if frame is None or max_size is None:
+            return frame
+        height, width = frame.shape[:2]
+        longest = max(height, width)
+        if longest <= max_size or longest == 0:
+            return frame
+        scale = max_size / longest
+        target = (max(1, int(width * scale)), max(1, int(height * scale)))
+        return cv2.resize(frame, target, interpolation=cv2.INTER_AREA)
+
+    def set_overlays(self, *, polygon: bool = True, count_line: bool = True) -> None:
+        """Toggle the vector overlays drawn into the annotated copy."""
+        self._show_polygon = bool(polygon)
+        self._show_count_line = bool(count_line)
+
+    def request_state_reset(self) -> None:
+        """Ask the worker to clear counters/tracks; safe from another thread."""
+        self._reset_requested.set()
+
+    def reset_state(self) -> None:
+        """Clear analysis state now. Call from the worker or a stopped pipeline."""
+        self._reset_state_now()
+
+    def _reset_state_now(self) -> None:
+        self.counter = VehicleCounter(
+            line_fraction=self.config.count_line_fraction,
+            window_seconds=self.config.window_seconds,
+        )
+        self.congestion = CongestionAnalyzer(
+            window_seconds=self.config.window_seconds,
+            moderate_threshold=self.config.congestion_moderate_threshold,
+            high_threshold=self.config.congestion_high_threshold,
+            stationary_threshold=self.config.congestion_stationary_threshold,
+            moderate_stationary_ratio=self.config.congestion_moderate_stationary_ratio,
+        )
+        self.tracker = VehicleTracker(
+            movement_threshold=self.config.movement_threshold,
+            max_track_age_s=self.config.max_track_age_s,
+        )
+        with self._lock:
+            self._metrics = None
+            self._annotated = None
+            self._last_frame_index = -1
+            self._last_process_at = None
+            self._process_times.clear()
+        _log.info("pipeline %s analysis state reset", self.camera_id)
 
     # -- worker -----------------------------------------------------------
 
     def _loop(self) -> None:
         next_due = time.monotonic()
         while not self._stop.is_set():
+            if self._reset_requested.is_set():
+                self._reset_requested.clear()
+                self._reset_state_now()
             frame = self.source.get_latest()
             now = time.monotonic()
 
@@ -277,10 +330,12 @@ class CameraPipeline:
         congestion_level: str,
     ) -> np.ndarray:
         canvas = image.copy()
-        self.region.draw(canvas)
+        if self._show_polygon:
+            self.region.draw(canvas)
 
-        line_y = self.counter.line_y(canvas.shape)
-        cv2.line(canvas, (0, line_y), (canvas.shape[1], line_y), (187, 63, 19), 2)
+        if self._show_count_line:
+            line_y = self.counter.line_y(canvas.shape)
+            cv2.line(canvas, (0, line_y), (canvas.shape[1], line_y), (187, 63, 19), 2)
 
         for obj in objects:
             x1, y1, x2, y2 = (int(value) for value in obj["coordinates"])
