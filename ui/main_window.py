@@ -11,7 +11,15 @@ from pathlib import Path
 
 import cv2
 from PySide6.QtCore import Qt, QSettings, QThreadPool, QTimer, QUrl
-from PySide6.QtGui import QAction, QDesktopServices, QImage, QKeySequence, QPixmap
+from PySide6.QtGui import (
+    QAction,
+    QBrush,
+    QColor,
+    QDesktopServices,
+    QImage,
+    QKeySequence,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -32,6 +40,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStatusBar,
     QTableWidget,
+    QTableWidgetItem,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -162,6 +171,10 @@ class MainWindow(QMainWindow):
         self.theme_action.setChecked(self.theme.name == "light")
         self.theme_action.toggled.connect(self._theme_toggled)
 
+        self.reduced_motion_action = QAction("Reduce motion", self)
+        self.reduced_motion_action.setCheckable(True)
+        self.reduced_motion_action.toggled.connect(self._set_reduced_motion)
+
         self.open_logs_action = QAction("Open logs folder", self)
         self.open_logs_action.triggered.connect(self._open_logs_folder)
 
@@ -263,6 +276,7 @@ class MainWindow(QMainWindow):
         settings_menu = menu.addMenu("Settings")
         settings_menu.addAction(self.open_config_action)
         settings_menu.addAction(self.theme_action)
+        settings_menu.addAction(self.reduced_motion_action)
 
         help_menu = menu.addMenu("Help")
         help_menu.addAction(self.about_action)
@@ -307,6 +321,9 @@ class MainWindow(QMainWindow):
                 camera.approach for camera in self.controller.config.cameras
             ),
         )
+        self.schematic_tile.setAccessibleName(
+            "T-junction recommendation, advisory only"
+        )
         for camera in self.controller.config.cameras:
             tile = CameraTile(
                 camera.id,
@@ -314,6 +331,7 @@ class MainWindow(QMainWindow):
                 camera.source,
                 theme=self.theme,
             )
+            tile.setAccessibleName(f"{camera.approach} camera {camera.id}")
             tile.clicked.connect(self._focus_camera)
             tile.double_clicked.connect(self._fullscreen_camera)
             tile.snapshot_requested.connect(self._snapshot_camera)
@@ -329,14 +347,19 @@ class MainWindow(QMainWindow):
             widget = item.widget()
             if widget is not None:
                 widget.setParent(self.grid_host)
-        items: list[QWidget] = list(self._tiles.values()) + [self.schematic_tile]
+        self.schematic_tile.setVisible(not self._focus_mode)
         if self._focus_mode and self._focused_camera in self._tiles:
             big = self._tiles[self._focused_camera]
             self.grid_layout.addWidget(big, 0, 0, 2, 2)
-            others = [tile for tile in items if tile is not big]
-            for index, tile in enumerate(others[:4]):
+            others = [
+                tile
+                for camera_id, tile in self._tiles.items()
+                if camera_id != self._focused_camera
+            ]
+            for index, tile in enumerate(others[:2]):
                 self.grid_layout.addWidget(tile, index, 2)
         else:
+            items: list[QWidget] = list(self._tiles.values()) + [self.schematic_tile]
             for index, tile in enumerate(items[:4]):
                 self.grid_layout.addWidget(tile, index // 2, index % 2)
 
@@ -422,12 +445,15 @@ class MainWindow(QMainWindow):
         self.camera_tree = QTreeWidget()
         self.camera_tree.setHeaderLabels(["Approach / camera", "Source"])
         self.camera_tree.setMinimumHeight(150)
+        self.camera_tree.setAccessibleName("Camera list")
+        self.camera_items: dict[str, QTreeWidgetItem] = {}
         root = QTreeWidgetItem(["Junction (T)", ""])
         self.camera_tree.addTopLevelItem(root)
         for camera in self.controller.config.cameras:
             item = QTreeWidgetItem([f"{camera.approach}  {camera.id}", camera.source])
             item.setData(0, Qt.ItemDataRole.UserRole, camera.id)
             root.addChild(item)
+            self.camera_items[camera.id] = item
         root.setExpanded(True)
         self.camera_tree.itemClicked.connect(self._tree_item_clicked)
         layout.addWidget(
@@ -470,7 +496,7 @@ class MainWindow(QMainWindow):
             "Start or stop the analysis and advisory link (F5)",
         )
         self.hold_button = button(
-            "Hold requests",
+            "Hold / Resume",
             self._toggle_hold,
             "",
             "Keep analysing and heartbeating without sending requests (Ctrl+H)",
@@ -482,25 +508,25 @@ class MainWindow(QMainWindow):
             "Clear smoothing, counters and tracks, then restart the gateway session (Ctrl+R)",
         )
         self.release_button = button(
-            "Release to autonomous",
+            "Release / Resume",
             self._toggle_release,
             "caution",
             "Close the heartbeat gate so the controller runs autonomously (Ctrl+L)",
         )
         export_button = button(
-            "Save / Export log…",
+            "Export log…",
             self._export_log,
             "",
             "Export JSONL, CSV or filtered log text (Ctrl+E)",
         )
         diagnostics_button = button(
-            "Export diagnostics…",
+            "Diagnostics…",
             self._export_diagnostics,
             "",
             "Zip redacted config, versions, logs and decisions; no images (Ctrl+Shift+E)",
         )
         snapshot_button = button(
-            "Save dashboard image…",
+            "Dashboard image…",
             self._snapshot_dashboard,
             "",
             "Save the dashboard image after one privacy warning (Ctrl+Shift+S)",
@@ -512,12 +538,12 @@ class MainWindow(QMainWindow):
             "Stop requests and heartbeats, flush logs and close (Ctrl+Q)",
         )
         logs_button = button(
-            "Open logs folder", self._open_logs_folder, "", "Open the decision-log folder"
+            "Open logs", self._open_logs_folder, "", "Open the decision-log folder"
         )
         config_button = button(
-            "View configuration", self._open_config, "", "Read-only, secrets redacted"
+            "View config", self._open_config, "", "Read-only, secrets redacted"
         )
-        about_button = button("About and limits", self._show_about, "", "Scope and safety limits")
+        about_button = button("About", self._show_about, "", "Scope and safety limits")
 
         buttons = [
             self.start_stop_button,
@@ -595,6 +621,12 @@ class MainWindow(QMainWindow):
 
     def _theme_toggled(self, light: bool) -> None:
         self.switch_theme("light" if light else "dark")
+
+    def _set_reduced_motion(self, enabled: bool) -> None:
+        self._reduced_motion = bool(enabled)
+        self.settings.setValue("view/reduced_motion", self._reduced_motion)
+        # The console has no decorative animation; this preference records the
+        # operator choice and is honoured by any future animation.
 
     def _set_focus_mode(self, enabled: bool) -> None:
         self._focus_mode = bool(enabled)
@@ -685,6 +717,17 @@ class MainWindow(QMainWindow):
         self.logs_action.setChecked(logs)
         self.logs_action.blockSignals(False)
         self.log_dock.setVisible(logs)
+        reduced = self.settings.value("view/reduced_motion", False) in (
+            True,
+            "true",
+            "True",
+            "1",
+            1,
+        )
+        self.reduced_motion_action.blockSignals(True)
+        self.reduced_motion_action.setChecked(reduced)
+        self.reduced_motion_action.blockSignals(False)
+        self._reduced_motion = reduced
 
     def _save_layout(self) -> None:
         self.settings.setValue("window/geometry", self.saveGeometry())
@@ -693,6 +736,9 @@ class MainWindow(QMainWindow):
         self.settings.setValue("view/focus", self._focus_mode)
         self.settings.setValue("view/overlays", self.overlays_action.isChecked())
         self.settings.setValue("view/logs", self.logs_action.isChecked())
+        self.settings.setValue(
+            "view/reduced_motion", self.reduced_motion_action.isChecked()
+        )
 
     # -- live updates ------------------------------------------------------
 
@@ -757,10 +803,10 @@ class MainWindow(QMainWindow):
 
         self.start_button.setText("STOP" if snapshot.started else "START")
         self.hold_button.setText(
-            "Resume requests" if snapshot.held else "Hold requests"
+            "Resume requests" if snapshot.held else "Hold / Resume"
         )
         self.release_button.setText(
-            "Resume control" if snapshot.released else "Release to autonomous"
+            "Resume control" if snapshot.released else "Release / Resume"
         )
         self.hold_action.setText(
             "Resume requests" if snapshot.held else "Hold requests"
@@ -845,6 +891,18 @@ class MainWindow(QMainWindow):
             )
         )
 
+        state_tokens = {
+            "LIVE": "status-ok",
+            "STALE": "status-warn",
+            "CONNECTING": "status-unknown",
+            "DISCONNECTED": "status-critical-text",
+        }
+        icons = {
+            "LIVE": "✓",
+            "STALE": "!",
+            "CONNECTING": "•",
+            "DISCONNECTED": "✕",
+        }
         for camera in snapshot.cameras:
             tile = self._tiles.get(camera.camera_id)
             if tile is not None:
@@ -855,6 +913,24 @@ class MainWindow(QMainWindow):
                     camera.reconnects,
                     snapshot.approach(camera.approach),
                     started=snapshot.started,
+                )
+            item = self.camera_items.get(camera.camera_id)
+            if item is not None:
+                item.setText(
+                    0, f"{icons.get(camera.state, '•')} {camera.approach}"
+                )
+                item.setText(
+                    1, f"{camera.source} · {camera.fps:.1f} fps"
+                )
+                item.setForeground(
+                    0,
+                    QBrush(
+                        QColor(
+                            self.theme.tokens[
+                                state_tokens.get(camera.state, "status-unknown")
+                            ]
+                        )
+                    ),
                 )
         self.schematic_tile.set_snapshot(snapshot)
 
@@ -1031,7 +1107,7 @@ class MainWindow(QMainWindow):
                 dialog.close()
 
         def failed(message: str) -> None:
-            QMessageBox.warning(self, "Export failed", message)
+            QMessageBox.warning(self, "Operation failed", message)
 
         task.signals.finished.connect(on_done)
         task.signals.finished.connect(cleanup)
@@ -1119,7 +1195,7 @@ class MainWindow(QMainWindow):
         ):
             return
         self._shutting_down = True
-        self.setEnabled(False)
+        self.centralWidget().setEnabled(False)
         progress = QProgressDialog("Shutting down…", "", 0, 0, self)
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setCancelButton(None)
@@ -1131,7 +1207,7 @@ class MainWindow(QMainWindow):
 
         def done(_result) -> None:
             progress.close()
-            self.setEnabled(True)
+            self.centralWidget().setEnabled(True)
             self.close()
 
         self._run_task(work, done)

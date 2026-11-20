@@ -109,8 +109,11 @@ def test_window_consumes_log_records(qt_app, tmp_path):
     window = MainWindow(controller, settings=settings)
     try:
         logging.getLogger("tests.window").warning("visible operator warning")
+        controller._events.publish("camera", "cam_main", "LIVE", "fps 8")
         window._refresh_panels()
         assert "visible operator warning" in window.log_panel.live.view.toPlainText()
+        assert window.events_table.rowCount() == 1
+        assert window.events_table.item(0, 1).text() == "cam_main"
     finally:
         window.close()
         controller.shutdown()

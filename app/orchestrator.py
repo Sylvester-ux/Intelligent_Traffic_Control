@@ -52,6 +52,7 @@ class Orchestrator:
         gateway: Optional[GatewayClient] = None,
         on_tick: Optional[Callable[[dict], None]] = None,
         annotate_frames: bool = False,
+        draw_stats: bool = True,
     ) -> None:
         self.config = config
         self.display = display or config.display
@@ -74,6 +75,7 @@ class Orchestrator:
                 factory(camera),
                 camera.pipeline_config(),
                 annotate=self.display or annotate_frames,
+                draw_stats=draw_stats,
             )
             for camera in config.cameras
         ]

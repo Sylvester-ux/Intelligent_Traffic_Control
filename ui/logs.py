@@ -80,6 +80,7 @@ class LiveLogTab(QWidget):
         layout.addLayout(controls)
 
         self.view = QPlainTextEdit()
+        self.view.setAccessibleName("Live log")
         self.view.setReadOnly(True)
         self.view.setMaximumBlockCount(capacity)
         self.view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
@@ -190,6 +191,7 @@ class DecisionsTab(QWidget):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(4)
         self.table = QTableWidget(0, len(self.HEADERS))
+        self.table.setAccessibleName("Decision records")
         self.table.setHorizontalHeaderLabels(self.HEADERS)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)

@@ -287,6 +287,50 @@ fixed-time baseline possible later. Note for log consumers: the old
 `recommendation.movement` is now `unit_id` plus `wire_movement`. Per-approach
 metrics and the request fields keep their names.
 
+## Operator console (optional)
+
+The PySide6 console is a separate layer. The core never imports it, and
+without `--gui` nothing changes. PySide6 is the only added dependency.
+
+```bash
+python main.py --config config.yaml --gui                 # real gateway
+python main.py --config config.yaml --gui --mock-gateway  # mock, amber banner
+python main.py --config config.yaml --gui --dry-run       # no gateway at all
+```
+
+Start the mock gateway first when using `--mock-gateway`:
+
+```bash
+python -m gateway.mock_gateway
+```
+
+Press **START** in the bottom bar (or F5). The console shows the three live
+annotated tiles, the advisory T-junction schematic, system state, live events,
+the log and the decision table. A persistent amber banner marks simulation
+(mock gateway, dry run or the three-phase proposal).
+
+| Control | Behaviour |
+| --- | --- |
+| Start / Stop (F5) | Start or stop pipelines and the decision loop. Stop confirms. |
+| Hold / Resume requests (Ctrl+H) | Keep analysing and heartbeating but send no `TRAFFIC_REQUEST`s; decisions are logged with `reason: operator_hold`. |
+| Reset analysis (Ctrl+R) | Confirm; clears smoothing, counters and tracks, and restarts the gateway session (sequence back to 1). |
+| Release to autonomous (Ctrl+L) | Confirm; closes the heartbeat gate so the controller runs its own cycle. Resume control restores normal gating. |
+| Save / Export log (Ctrl+E) | Save-as for JSONL, flattened CSV or the filtered log text; range last 5 min, last hour, all decisions or selected rows. Runs in a worker with progress and a Show-in-folder result. |
+| Export diagnostics (Ctrl+Shift+E) | Zip with redacted config, versions, logs, decisions and camera health. Never images. |
+| Save dashboard image (Ctrl+Shift+S) | Explicit click only, with one privacy warning. |
+| Shutdown (Ctrl+Q) | Confirm; stops requests and heartbeats, flushes logs, joins threads and closes. |
+| Open logs folder / View configuration / About | Convenience; the config view is read-only and redacted. |
+
+The console is advisory: it shows the last recommendation, the controller's
+reply and derived expected red. It never draws a lamp as physical state. Tile
+context menus add polygon/line toggles, flip, snapshot and fullscreen. Focus
+mode (F11) shows one large camera and two small ones. Light theme and reduced
+motion are in Settings and persist with the window layout.
+
+A representative screenshot (synthetic video, dry run, offscreen render) is
+[`docs/ui/console.png`](docs/ui/console.png). No real camera or controller was
+used for it.
+
 ## Tests
 
 ```bash

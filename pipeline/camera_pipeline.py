@@ -67,6 +67,7 @@ class CameraPipeline:
         config: Optional[PipelineConfig] = None,
         *,
         annotate: bool = False,
+        draw_stats: bool = True,
     ) -> None:
         self.camera_id = camera_id
         self.approach_id = approach_id
@@ -74,6 +75,8 @@ class CameraPipeline:
         self.detector = detector
         self.config = config or PipelineConfig()
         self.annotate = annotate
+        # The GUI paints its own corner telemetry; --display keeps these stats.
+        self.draw_stats = draw_stats
 
         self.region = RoadRegion(list(self.config.polygon))
         self.counter = VehicleCounter(
@@ -353,21 +356,22 @@ class CameraPipeline:
                 1,
             )
 
-        stats = self.counter.get_statistics()
-        lines = [
-            f"{self.approach_id} ({self.camera_id})",
-            f"Veh in region: {len([o for o in objects if o['category'] == 'vehicle'])}",
-            f"Counted: {stats['vehicles']}",
-            f"Congestion: {congestion_level}",
-        ]
-        for index, text in enumerate(lines):
-            cv2.putText(
-                canvas,
-                text,
-                (8, 18 + index * 18),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (255, 255, 0) if index else (255, 255, 255),
-                1,
-            )
+        if self.draw_stats:
+            stats = self.counter.get_statistics()
+            lines = [
+                f"{self.approach_id} ({self.camera_id})",
+                f"Veh in region: {len([o for o in objects if o['category'] == 'vehicle'])}",
+                f"Counted: {stats['vehicles']}",
+                f"Congestion: {congestion_level}",
+            ]
+            for index, text in enumerate(lines):
+                cv2.putText(
+                    canvas,
+                    text,
+                    (8, 18 + index * 18),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (255, 255, 0) if index else (255, 255, 255),
+                    1,
+                )
         return canvas

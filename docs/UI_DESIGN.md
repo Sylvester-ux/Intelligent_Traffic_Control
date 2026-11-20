@@ -178,3 +178,70 @@ theme, overlay visibility and reduced motion.
 5. Live log and decisions table with filters, search and caps.
 6. Controls, confirmations, worker exports, diagnostics, shortcuts.
 7. Accessibility/polish, light theme, persisted layout, README and screenshots.
+
+## 10. Implementation status and measured impact
+
+Phases 0-7 are implemented. The console is `--gui` only; `python main.py`
+without it, the existing `--display` window and all 99 original tests are
+unchanged. The core/UI guard test parses every core package and asserts it
+imports neither `ui` nor PySide6, including in a fresh subprocess.
+
+### Measured GUI impact (Phase 3 requirement)
+
+Method: three synthetic 15 fps file sources, the same fake detector, a mock
+gateway at a 0.1 s heartbeat interval, warm-up, then a 4 s window. The GUI run
+builds and shows the real window offscreen, processes Qt events continuously
+and repaints tiles at 10 fps. Both runs used the same CPU and configuration.
+
+| Metric | Headless | GUI (offscreen) |
+| --- | --- | --- |
+| Source fps MAIN / SEC_A / SEC_B | 14.89 / 14.97 / 14.85 | 14.94 / 14.94 / 14.94 |
+| Processed fps MAIN / SEC_A / SEC_B | 12.28 / 12.50 / 12.73 | 12.79 / 12.59 / 12.71 |
+| Heartbeats in 4 s (0.1 s target) | 36 | 36 |
+| Mean heartbeat gap | 0.110 s | 0.110 s |
+| Maximum heartbeat gap | 0.127 s | 0.112 s |
+
+Within this environment the console did not reduce pipeline throughput or
+heartbeat regularity; the differences are inside run-to-run noise. This is a
+short Windows/CPU measurement, not a soak test, and it says nothing about a
+real camera, ESP32 or Uno.
+
+### Screenshot
+
+`docs/ui/console.png` is an offscreen capture of the real window driven by
+synthetic clips and the mock gateway: three live tiles, the advisory schematic,
+system state, controls, log and decision table, with the amber simulation
+banner. It was rendered with system Segoe UI/Consolas loaded explicitly because
+Qt's offscreen platform on this machine does not discover the Windows font
+directory. No font, icon or stock asset is bundled by the app. The screenshot
+contains no real people, plates or site imagery.
+
+During the screenshot review two defects were found and fixed: the pipeline's
+baked-in stats duplicated the tile telemetry (GUI frames now draw shapes/boxes
+only, while `--display` keeps its stats), and long control labels clipped in the
+sidebar (labels are now short, with the full action names and tooltips in the
+menus).
+
+### Not tested
+
+- Real RTSP cameras, ESP32-S3, Arduino Uno, lamps or bench wiring.
+- High-DPI scaling, multi-monitor placement, touch input and Windows text
+  scaling above 100%.
+- Long soak runs, log rotation under sustained load, and a real 30-minute
+  heartbeat session.
+- Modal export/diagnostics dialogs end-to-end on a desktop; their controller
+  and exporter logic is covered without Qt, and the GUI builds offscreen.
+
+**Nothing in the GUI, decisions or protocol was verified on hardware.**
+
+### Open items and controls not added
+
+- No manual "send test request" button was added, even for loopback; the
+  gateway is only driven by the decision engine. This avoids any operator path
+  that could send a request against real firmware.
+- PTZ and numbered preset controls were skipped: the cameras are fixed.
+- Three-phase movements remain a disabled proposal; the banner marks them as
+  simulation and the firmware does not exist.
+- The optional light theme uses darkened status/identity hues; the dark theme's
+  measured AA pairs are in section 5. `text-muted` is intentionally decorative
+  only and is never used for status or body copy.

@@ -57,6 +57,7 @@ class _Session:
 @dataclass
 class _Stats:
     heartbeats: int = 0
+    heartbeat_times: list[float] = field(default_factory=list)
     traffic_requests: list[dict] = field(default_factory=list)
     errors_sent: list[str] = field(default_factory=list)
 
@@ -163,6 +164,12 @@ class MockGateway:
             return self._stats.heartbeats
 
     @property
+    def heartbeat_times(self) -> list[float]:
+        """Monotonic arrival times, for measuring heartbeat regularity."""
+        with self._lock:
+            return list(self._stats.heartbeat_times)
+
+    @property
     def errors_sent(self) -> list[str]:
         with self._lock:
             return list(self._stats.errors_sent)
@@ -247,6 +254,7 @@ class MockGateway:
             session.last_heartbeat_at = time.monotonic()
             with self._lock:
                 self._stats.heartbeats += 1
+                self._stats.heartbeat_times.append(session.last_heartbeat_at)
             self._reply(conn, ack_heartbeat())
             return
 

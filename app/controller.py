@@ -91,6 +91,7 @@ class AppController:
             gateway=gateway,
             on_tick=self._on_tick,
             annotate_frames=annotate_frames,
+            draw_stats=False,
         )
         self.attach_logging()
 

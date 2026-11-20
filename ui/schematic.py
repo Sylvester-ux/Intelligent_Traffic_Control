@@ -155,36 +155,6 @@ class SchematicCanvas(QWidget):
             right=True,
         )
 
-        expected = snapshot.expected_red_s if snapshot else {}
-        if snapshot is not None:
-            for unit in snapshot.units:
-                if unit.unit_id == "SECONDARY":
-                    text = f"SECONDARY red ~{unit.expected_red_s or 0:.0f}s"
-                    self._label(
-                        painter,
-                        width - 8,
-                        int(junction_y) + 18,
-                        text,
-                        "text-secondary",
-                        right=True,
-                        size=9,
-                    )
-                elif unit.unit_id in ("MAIN", "SEC_A", "SEC_B"):
-                    continue
-            if expected:
-                parts = [
-                    f"{unit_id} ~{value:.0f}s"
-                    for unit_id, value in sorted(expected.items())
-                ]
-                self._label(
-                    painter,
-                    8,
-                    height - 8,
-                    "Expected red · " + "  ".join(parts),
-                    "text-secondary",
-                    size=9,
-                )
-
         if recommended is not None and green is not None:
             text = f"RECOMMENDED {unit_id} · {green}s (advisory)"
             tone = UNIT_COLOURS.get(unit_id, "accent-text")
