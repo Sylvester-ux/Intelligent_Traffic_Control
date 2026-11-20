@@ -50,10 +50,16 @@ class Orchestrator:
         dry_run: bool = False,
         detector_factory: Optional[DetectorFactory] = None,
         gateway: Optional[GatewayClient] = None,
+        on_tick: Optional[Callable[[dict], None]] = None,
+        annotate_frames: bool = False,
+        draw_stats: bool = True,
     ) -> None:
         self.config = config
         self.display = display or config.display
         self.dry_run = dry_run
+        # The GUI needs annotated copies but must not open the OpenCV window.
+        self.annotate_frames = annotate_frames
+        self.on_tick = on_tick
 
         self.sources = {
             camera.id: build_source(camera) for camera in config.cameras
@@ -68,7 +74,8 @@ class Orchestrator:
                 self.sources[camera.id],
                 factory(camera),
                 camera.pipeline_config(),
-                annotate=self.display,
+                annotate=self.display or annotate_frames,
+                draw_stats=draw_stats,
             )
             for camera in config.cameras
         ]
@@ -97,6 +104,10 @@ class Orchestrator:
         self._started = False
         self._last_tick_at: Optional[float] = None
         self._gate_state: Optional[bool] = None
+        self._gate_reason = "not started"
+        self._requests_held = False
+        self._operator_released = False
+        self._reset_requested = threading.Event()
 
     # -- lifecycle --------------------------------------------------------
 
@@ -156,6 +167,91 @@ class Orchestrator:
         self._started = False
         _log.info("orchestrator stopped")
 
+    # -- operator controls (safe to call from another thread) --------------
+
+    def hold_requests(self) -> None:
+        """Keep analysing and heartbeating, but stop sending requests."""
+        if not self._requests_held:
+            self._requests_held = True
+            _log.warning(
+                "operator hold: analysis continues, traffic requests suppressed"
+            )
+
+    def resume_requests(self) -> None:
+        if self._requests_held:
+            self._requests_held = False
+            _log.info("operator hold cleared: requests resume")
+
+    @property
+    def requests_held(self) -> bool:
+        return self._requests_held
+
+    def request_reset(self) -> None:
+        """Ask the decision loop to clear analysis state and restart the link."""
+        self._reset_requested.set()
+
+    def release_to_autonomous(self) -> None:
+        """Close the heartbeat gate on purpose so the Uno runs autonomously."""
+        if not self._operator_released:
+            self._operator_released = True
+            self._gate_reason = "Operator release: controller runs autonomously"
+            _log.warning(
+                "operator release: heartbeat gate CLOSED; the controller "
+                "runs its autonomous cycle"
+            )
+
+    def resume_control(self) -> None:
+        if self._operator_released:
+            self._operator_released = False
+            self._gate_reason = "operator release cleared"
+            _log.info("operator release cleared: normal health gating resumes")
+
+    @property
+    def operator_released(self) -> bool:
+        return self._operator_released
+
+    def set_overlays(self, *, polygon: bool = True, count_line: bool = True) -> None:
+        for pipeline in self.pipelines:
+            pipeline.set_overlays(polygon=polygon, count_line=count_line)
+
+    def set_camera_overlays(
+        self, camera_id: str, *, polygon: bool = True, count_line: bool = True
+    ) -> None:
+        for pipeline in self.pipelines:
+            if pipeline.camera_id == camera_id:
+                pipeline.set_overlays(polygon=polygon, count_line=count_line)
+                return
+
+    def annotated_frame(self, camera_id: str, max_size: int = 640):
+        """Return a downscaled annotated copy, never the full-size buffer."""
+        for pipeline in self.pipelines:
+            if pipeline.camera_id == camera_id:
+                return pipeline.latest_annotated(max_size=max_size)
+        return None
+
+    def gate_reason(self) -> str:
+        """Plain-language reason for the current gate state."""
+        if self._operator_released:
+            return "Operator release: controller runs autonomously"
+        if not self._started:
+            return "stopped"
+        if self.health_gate_open():
+            return "decision loop and cameras healthy"
+        return self._gate_reason
+
+    def _apply_reset(self) -> None:
+        self._reset_requested.clear()
+        self.engine.reset()
+        for pipeline in self.pipelines:
+            # The pipeline worker performs the reset on its own thread.
+            pipeline.request_state_reset()
+        if self.gateway is not None:
+            self.gateway.restart_session()
+        _log.info(
+            "operator reset: smoothing, counters and tracks cleared; "
+            "gateway session restarting"
+        )
+
     def run(self, duration_s: Optional[float] = None) -> None:
         """Block until Ctrl-C, ``q`` in the display, or ``duration_s`` elapses."""
         self.start()
@@ -191,6 +287,9 @@ class Orchestrator:
         if now is None:
             now = time.monotonic()
 
+        if self._reset_requested.is_set():
+            self._apply_reset()
+
         metrics: dict[str, ApproachMetrics] = {
             pipeline.approach_id: pipeline.latest_metrics()
             for pipeline in self.pipelines
@@ -210,10 +309,23 @@ class Orchestrator:
         )
         if self.decision_log is not None:
             self.decision_log.write(entry)
+        if self.on_tick is not None:
+            try:
+                self.on_tick(entry)
+            except Exception:  # noqa: BLE001 - the GUI must not break control
+                _log.exception("on_tick callback failed")
         return entry
 
     def _send(self, recommendation: Recommendation) -> dict:
         wire = self.adapter.to_wire(recommendation)
+        if self._requests_held:
+            return {
+                "sent": False,
+                "reason": "operator_hold",
+                "unit_id": wire.unit_id,
+                "movement": wire.movement,
+                "green_time": wire.green_time,
+            }
         if self.dry_run or self.gateway is None:
             return {
                 "sent": False,
@@ -261,6 +373,8 @@ class Orchestrator:
 
     def health_gate_open(self) -> bool:
         """True while the host is healthy enough to keep the link alive."""
+        if self._operator_released:
+            return False
         now = time.monotonic()
         if self._last_tick_at is None:
             return False
@@ -278,6 +392,7 @@ class Orchestrator:
             return
         self._gate_state = gate_open
         if gate_open:
+            self._gate_reason = "decision loop and cameras healthy"
             _log.info("heartbeat gate OPEN: decision loop and cameras healthy")
             return
 
@@ -300,9 +415,10 @@ class Orchestrator:
             reasons.append(
                 f"{len(live)}/{self.config.required_camera_count} cameras fresh"
             )
+        self._gate_reason = "; ".join(reasons) or "not ready"
         _log.warning(
             "heartbeat gate CLOSED: %s; the controller runs autonomously",
-            "; ".join(reasons) or "not ready",
+            self._gate_reason,
         )
 
     # -- logging ----------------------------------------------------------

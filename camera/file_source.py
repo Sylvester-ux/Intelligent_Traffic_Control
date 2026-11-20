@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -46,6 +47,10 @@ class FileSource(ThreadedFrameSource):
         self._capture: Optional[cv2.VideoCapture] = None
         self._file_fps = 25.0
         self._next_due = 0.0
+        # Testing aid only: playback controls never affect decision timing.
+        self._paused = threading.Event()
+        self._restart_requested = threading.Event()
+        self._speed = 1.0
 
     def _open(self) -> None:
         if not self.path.is_file():
@@ -60,9 +65,38 @@ class FileSource(ThreadedFrameSource):
         self._capture = capture
         _log.info("opened %s (%.1f fps)", self.path, self._file_fps)
 
+    # -- playback controls (file sources only) ----------------------------
+
+    def pause(self) -> None:
+        self._paused.set()
+
+    def resume(self) -> None:
+        self._paused.clear()
+
+    def set_speed(self, factor: float) -> None:
+        """Set video feed speed; decision timing stays wall-clock."""
+        self._speed = max(0.25, min(4.0, float(factor)))
+
+    @property
+    def speed(self) -> float:
+        return self._speed
+
+    def restart(self) -> None:
+        self._restart_requested.set()
+
+    def _wait_if_paused(self) -> None:
+        while self._paused.is_set() and not self._stop.is_set():
+            self._stop.wait(0.05)
+
     def _read(self) -> tuple[bool, Optional[np.ndarray]]:
+        self._wait_if_paused()
         if self._capture is None:
             return False, None
+
+        if self._restart_requested.is_set():
+            self._restart_requested.clear()
+            self._capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            self._next_due = time.monotonic()
 
         ok, frame = self._capture.read()
         if not ok:
@@ -87,7 +121,8 @@ class FileSource(ThreadedFrameSource):
         delay = self._next_due - now
         if delay > 0:
             self._stop.wait(delay)
-        self._next_due += 1.0 / self._file_fps
+        interval = 1.0 / max(0.1, self._file_fps * self._speed)
+        self._next_due = max(self._next_due, now) + interval
 
     def _close(self) -> None:
         if self._capture is not None:
