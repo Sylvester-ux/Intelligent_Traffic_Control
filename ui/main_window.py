@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 import cv2
-from PySide6.QtCore import Qt, QSettings, QTimer, QUrl
+from PySide6.QtCore import Qt, QSettings, QThreadPool, QTimer, QUrl
 from PySide6.QtGui import QAction, QDesktopServices, QImage, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -41,8 +42,10 @@ from app.controller import AppController
 from app.exporters import config_yaml
 from app.snapshots import UiSnapshot
 from ui.dialogs import about_text, confirm
+from ui.export_dialog import ExportLogDialog
 from ui.logs import LogPanel
 from ui.schematic import SchematicTile
+from ui.tasks import FunctionTask
 from ui.theme import DARK, THEMES, stylesheet
 from ui.tiles import CameraTile
 from ui.widgets import (
@@ -73,6 +76,8 @@ class MainWindow(QMainWindow):
         self._focus_mode = False
         self._playback_paused = False
         self._snapshot_warned = False
+        self._shutting_down = False
+        self._tasks: set[FunctionTask] = set()
         self._tiles: dict[str, CameraTile] = {}
         self._flip_state = {
             camera.id: camera.flip for camera in controller.config.cameras
@@ -103,8 +108,35 @@ class MainWindow(QMainWindow):
 
     def _build_actions(self) -> None:
         self.exit_action = QAction("Exit", self)
-        self.exit_action.setShortcut(QKeySequence("Ctrl+Q"))
         self.exit_action.triggered.connect(self.close)
+
+        self.shutdown_action = QAction("Shutdown", self)
+        self.shutdown_action.setShortcut(QKeySequence("Ctrl+Q"))
+        self.shutdown_action.triggered.connect(self._shutdown)
+
+        self.hold_action = QAction("Hold requests", self)
+        self.hold_action.setShortcut(QKeySequence("Ctrl+H"))
+        self.hold_action.triggered.connect(self._toggle_hold)
+
+        self.reset_action = QAction("Reset analysis", self)
+        self.reset_action.setShortcut(QKeySequence("Ctrl+R"))
+        self.reset_action.triggered.connect(self._reset)
+
+        self.release_action = QAction("Release to autonomous", self)
+        self.release_action.setShortcut(QKeySequence("Ctrl+L"))
+        self.release_action.triggered.connect(self._toggle_release)
+
+        self.export_log_action = QAction("Export log…", self)
+        self.export_log_action.setShortcut(QKeySequence("Ctrl+E"))
+        self.export_log_action.triggered.connect(self._export_log)
+
+        self.export_diagnostics_action = QAction("Export diagnostics…", self)
+        self.export_diagnostics_action.setShortcut(QKeySequence("Ctrl+Shift+E"))
+        self.export_diagnostics_action.triggered.connect(self._export_diagnostics)
+
+        self.dashboard_snapshot_action = QAction("Save dashboard snapshot…", self)
+        self.dashboard_snapshot_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        self.dashboard_snapshot_action.triggered.connect(self._snapshot_dashboard)
 
         self.start_action = QAction("Start / Stop", self)
         self.start_action.setShortcut(QKeySequence("F5"))
@@ -201,7 +233,15 @@ class MainWindow(QMainWindow):
 
         file_menu = menu.addMenu("File")
         file_menu.addAction(self.start_action)
+        file_menu.addAction(self.hold_action)
+        file_menu.addAction(self.reset_action)
+        file_menu.addAction(self.release_action)
         file_menu.addSeparator()
+        file_menu.addAction(self.export_log_action)
+        file_menu.addAction(self.export_diagnostics_action)
+        file_menu.addAction(self.dashboard_snapshot_action)
+        file_menu.addSeparator()
+        file_menu.addAction(self.shutdown_action)
         file_menu.addAction(self.exit_action)
 
         view_menu = menu.addMenu("View")
@@ -396,18 +436,107 @@ class MainWindow(QMainWindow):
             )
         )
 
-        controls = QLabel("Controls are added with the operator panel.")
-        controls.setObjectName("helper")
-        controls.setWordWrap(True)
-        controls.setContentsMargins(10, 8, 10, 8)
         self.controls_section = CollapsibleSection(
-            "Controls", controls, settings=self.settings, key="controls"
+            "Controls",
+            self._build_controls(),
+            settings=self.settings,
+            key="controls",
+            expanded=True,
         )
         layout.addWidget(self.controls_section)
         layout.addStretch(1)
 
         scroll.setWidget(sidebar)
         return scroll
+
+    def _build_controls(self) -> QWidget:
+        box = QWidget()
+        grid = QGridLayout(box)
+        grid.setContentsMargins(8, 6, 8, 8)
+        grid.setSpacing(6)
+
+        def button(text: str, slot, variant: str, tooltip: str) -> QPushButton:
+            btn = QPushButton(text)
+            if variant:
+                btn.setProperty("variant", variant)
+            btn.setToolTip(tooltip)
+            btn.clicked.connect(slot)
+            return btn
+
+        self.start_stop_button = button(
+            "Start / Stop",
+            self._toggle_started,
+            "primary",
+            "Start or stop the analysis and advisory link (F5)",
+        )
+        self.hold_button = button(
+            "Hold requests",
+            self._toggle_hold,
+            "",
+            "Keep analysing and heartbeating without sending requests (Ctrl+H)",
+        )
+        self.reset_button = button(
+            "Reset analysis",
+            self._reset,
+            "destructive",
+            "Clear smoothing, counters and tracks, then restart the gateway session (Ctrl+R)",
+        )
+        self.release_button = button(
+            "Release to autonomous",
+            self._toggle_release,
+            "caution",
+            "Close the heartbeat gate so the controller runs autonomously (Ctrl+L)",
+        )
+        export_button = button(
+            "Save / Export log…",
+            self._export_log,
+            "",
+            "Export JSONL, CSV or filtered log text (Ctrl+E)",
+        )
+        diagnostics_button = button(
+            "Export diagnostics…",
+            self._export_diagnostics,
+            "",
+            "Zip redacted config, versions, logs and decisions; no images (Ctrl+Shift+E)",
+        )
+        snapshot_button = button(
+            "Save dashboard image…",
+            self._snapshot_dashboard,
+            "",
+            "Save the dashboard image after one privacy warning (Ctrl+Shift+S)",
+        )
+        shutdown_button = button(
+            "Shutdown",
+            self._shutdown,
+            "destructive",
+            "Stop requests and heartbeats, flush logs and close (Ctrl+Q)",
+        )
+        logs_button = button(
+            "Open logs folder", self._open_logs_folder, "", "Open the decision-log folder"
+        )
+        config_button = button(
+            "View configuration", self._open_config, "", "Read-only, secrets redacted"
+        )
+        about_button = button("About and limits", self._show_about, "", "Scope and safety limits")
+
+        buttons = [
+            self.start_stop_button,
+            self.hold_button,
+            self.reset_button,
+            self.release_button,
+            export_button,
+            diagnostics_button,
+            snapshot_button,
+            shutdown_button,
+            logs_button,
+            config_button,
+            about_button,
+        ]
+        for index, widget in enumerate(buttons):
+            grid.addWidget(widget, index // 2, index % 2)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        return box
 
     def _build_status_bar(self) -> None:
         bar = QStatusBar()
@@ -627,6 +756,18 @@ class MainWindow(QMainWindow):
         self._snapshot = snapshot
 
         self.start_button.setText("STOP" if snapshot.started else "START")
+        self.hold_button.setText(
+            "Resume requests" if snapshot.held else "Hold requests"
+        )
+        self.release_button.setText(
+            "Resume control" if snapshot.released else "Release to autonomous"
+        )
+        self.hold_action.setText(
+            "Resume requests" if snapshot.held else "Hold requests"
+        )
+        self.release_action.setText(
+            "Resume control" if snapshot.released else "Release to autonomous"
+        )
         self.session_label.setText(format_uptime(snapshot.uptime_s))
 
         if snapshot.fresh_cameras == snapshot.required_cameras and snapshot.required_cameras:
@@ -740,19 +881,23 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Could not start", str(exc))
         self._refresh_status()
 
+    def _warn_snapshot_privacy(self) -> None:
+        if self._snapshot_warned:
+            return
+        QMessageBox.information(
+            self,
+            "Snapshot privacy",
+            "Camera frames may show people and number plates. "
+            "A snapshot is saved only when you choose to, and exports "
+            "never contain images.",
+        )
+        self._snapshot_warned = True
+
     def _snapshot_camera(self, camera_id: str) -> None:
         tile = self._tiles.get(camera_id)
         if tile is None:
             return
-        if not self._snapshot_warned:
-            QMessageBox.information(
-                self,
-                "Snapshot privacy",
-                "Camera frames may show people and number plates. "
-                "A snapshot is saved only when you choose to, and exports "
-                "never contain images.",
-            )
-            self._snapshot_warned = True
+        self._warn_snapshot_privacy()
         default = f"snapshot_{tile.approach}_{datetime.now():%Y%m%d_%H%M%S}.png"
         path, _filter = QFileDialog.getSaveFileName(
             self, "Save tile snapshot", default, "PNG image (*.png)"
@@ -807,6 +952,190 @@ class MainWindow(QMainWindow):
         dialog.exec()
         timer.stop()
 
+    def _toggle_hold(self) -> None:
+        if self.controller.held:
+            self.controller.resume_requests()
+        else:
+            self.controller.hold_requests()
+        self._refresh_status()
+
+    def _reset(self) -> None:
+        if not confirm(
+            self,
+            "Reset analysis state?",
+            "Clear smoothing windows, counters, track state and restart the gateway session?",
+            confirm_label="Reset",
+            informative=(
+                "Configuration and model weights are kept. The sequence restarts "
+                "at 1 on the new session."
+            ),
+        ):
+            return
+        self.controller.reset()
+        self.statusBar().showMessage("Reset requested", 4000)
+
+    def _toggle_release(self) -> None:
+        if self.controller.released:
+            self.controller.resume_control()
+            self._refresh_status()
+            return
+        if not confirm(
+            self,
+            "Release to the controller?",
+            "Close the heartbeat gate so the controller runs autonomously?",
+            confirm_label="Release",
+            informative=("The controller keeps its own cycle until you click Resume control."),
+        ):
+            return
+        self.controller.release_to_autonomous()
+        self._refresh_status()
+
+    def _snapshot_dashboard(self) -> None:
+        self._warn_snapshot_privacy()
+        default = f"dashboard_{datetime.now():%Y%m%d_%H%M%S}.png"
+        path, _filter = QFileDialog.getSaveFileName(
+            self, "Save dashboard snapshot", default, "PNG image (*.png)"
+        )
+        if not path:
+            return
+        if not self.grab().save(path):
+            QMessageBox.warning(self, "Snapshot failed", f"Could not write {path}")
+
+    def _run_task(
+        self,
+        function,
+        on_done,
+        *,
+        title: str = "Working…",
+        progress: bool = False,
+    ) -> None:
+        task = FunctionTask(function)
+        self._tasks.add(task)
+        dialog = None
+        if progress:
+            dialog = QProgressDialog(title, "", 0, 100, self)
+            dialog.setWindowModality(Qt.WindowModality.WindowModal)
+            dialog.setMinimumDuration(0)
+            dialog.setCancelButton(None)
+            dialog.setValue(0)
+            dialog.show()
+            task.signals.progress.connect(
+                lambda done, total: dialog.setValue(
+                    0 if total <= 0 else int(100 * done / total)
+                )
+            )
+
+        def cleanup(*_args) -> None:
+            self._tasks.discard(task)
+            if dialog is not None:
+                dialog.close()
+
+        def failed(message: str) -> None:
+            QMessageBox.warning(self, "Export failed", message)
+
+        task.signals.finished.connect(on_done)
+        task.signals.finished.connect(cleanup)
+        task.signals.failed.connect(failed)
+        task.signals.failed.connect(cleanup)
+        QThreadPool.globalInstance().start(task)
+
+    def _export_log(self) -> None:
+        selected = self.log_panel.decisions.selected_entries()
+        dialog = ExportLogDialog(
+            self,
+            default_dir=Path(self.controller.config.logging.decision_log).resolve().parent,
+            has_selection=bool(selected),
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        path, fmt, range_key = dialog.values()
+        if not path:
+            QMessageBox.warning(self, "Export log", "Choose a destination file.")
+            return
+        selected_for_export = selected if range_key == "selected" else None
+        text_lines = (
+            self.log_panel.live.visible_lines() if fmt == "text" else None
+        )
+
+        def work(emit):
+            return self.controller.export_log(
+                path,
+                fmt,
+                range_key,
+                selected=selected_for_export,
+                text_lines=text_lines,
+                progress=emit,
+            )
+
+        self._run_task(
+            work,
+            lambda result: self._export_finished(path, result),
+            title="Exporting log…",
+            progress=True,
+        )
+
+    def _export_finished(self, path: str, result) -> None:
+        box = QMessageBox(self)
+        box.setWindowTitle("Export complete")
+        box.setText("Export complete")
+        rows = result if isinstance(result, int) else ""
+        box.setInformativeText(f"{rows} rows\n{path}" if rows != "" else str(path))
+        open_button = box.addButton("Show in folder", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Close)
+        box.exec()
+        if box.clickedButton() is open_button:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(path).resolve().parent)))
+
+    def _export_diagnostics(self) -> None:
+        default = f"diagnostics_{datetime.now():%Y%m%d_%H%M%S}.zip"
+        path, _filter = QFileDialog.getSaveFileName(
+            self, "Export diagnostics", default, "Zip archive (*.zip)"
+        )
+        if not path:
+            return
+
+        def work(emit):
+            return self.controller.export_diagnostics(path, progress=emit)
+
+        self._run_task(
+            work,
+            lambda result: self._export_finished(str(result), None),
+            title="Building diagnostics…",
+            progress=True,
+        )
+
+    def _shutdown(self) -> None:
+        if self._shutting_down:
+            return
+        if not confirm(
+            self,
+            "Shutdown the host?",
+            "Stop requests and heartbeats, flush logs and close the console?",
+            confirm_label="Shutdown",
+            informative=(
+                "The controller runs autonomously after the heartbeat gate "
+                "closes. Logs are flushed before the window exits."
+            ),
+        ):
+            return
+        self._shutting_down = True
+        self.setEnabled(False)
+        progress = QProgressDialog("Shutting down…", "", 0, 0, self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setCancelButton(None)
+        progress.show()
+
+        def work(_emit):
+            self.controller.shutdown()
+            return True
+
+        def done(_result) -> None:
+            progress.close()
+            self.setEnabled(True)
+            self.close()
+
+        self._run_task(work, done)
+
     def _toggle_playback(self) -> None:
         self._playback_paused = not self._playback_paused
         if self._playback_paused:
@@ -842,7 +1171,7 @@ class MainWindow(QMainWindow):
     # -- shutdown ----------------------------------------------------------
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
-        if self.controller.running:
+        if self.controller.running and not self._shutting_down:
             if not confirm(
                 self,
                 "Shutdown the host?",
