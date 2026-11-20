@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import socket
 import time
 
@@ -190,14 +191,15 @@ def test_out_of_policy_reply_from_gateway():
     gateway.start()
     sock = socket.create_connection(("127.0.0.1", gateway.port), timeout=2.0)
     sock.settimeout(2.0)
+    reader = WireReader(sock)
     try:
         sock.sendall(b'{"type":"HEARTBEAT"}\n')
-        assert _read_message(sock)["status"] == "HEARTBEAT_OK"
+        assert reader.read()["status"] == "HEARTBEAT_OK"
         sock.sendall(
             b'{"type":"TRAFFIC_REQUEST","movement":"MAIN","green_time":99,'
             b'"priority":"NORMAL","sequence":1}\n'
         )
-        reply = _read_message(sock)
+        reply = reader.read()
         assert reply == {"type": "ERROR", "reason": "OUT_OF_POLICY"}
     finally:
         sock.close()
@@ -209,16 +211,17 @@ def test_split_and_merged_chunks_on_the_wire():
     gateway.start()
     sock = socket.create_connection(("127.0.0.1", gateway.port), timeout=2.0)
     sock.settimeout(2.0)
+    reader = WireReader(sock)
     try:
         # One heartbeat split across two sends.
         sock.sendall(b'{"type":"HEA')
         sock.sendall(b'RTBEAT"}\n')
-        assert _read_message(sock)["status"] == "HEARTBEAT_OK"
+        assert reader.read()["status"] == "HEARTBEAT_OK"
 
-        # Two heartbeats in a single send.
+        # Two heartbeats in a single send; replies may share one TCP segment.
         sock.sendall(b'{"type":"HEARTBEAT"}\n{"type":"HEARTBEAT"}\n')
-        assert _read_message(sock)["status"] == "HEARTBEAT_OK"
-        assert _read_message(sock)["status"] == "HEARTBEAT_OK"
+        assert reader.read()["status"] == "HEARTBEAT_OK"
+        assert reader.read()["status"] == "HEARTBEAT_OK"
     finally:
         sock.close()
         gateway.stop()
@@ -229,10 +232,11 @@ def test_oversized_line_is_discarded_then_stream_recovers():
     gateway.start()
     sock = socket.create_connection(("127.0.0.1", gateway.port), timeout=2.0)
     sock.settimeout(3.0)
+    reader = WireReader(sock)
     try:
         sock.sendall(b"z" * 700 + b"\n")
         sock.sendall(b'{"type":"HEARTBEAT"}\n')
-        reply = _read_message(sock)
+        reply = reader.read()
         assert reply["status"] == "HEARTBEAT_OK"
     finally:
         sock.close()
@@ -243,9 +247,10 @@ def test_second_client_is_refused():
     gateway = MockGateway(port=0)
     gateway.start()
     first = socket.create_connection(("127.0.0.1", gateway.port), timeout=2.0)
+    reader = WireReader(first)
     try:
         first.sendall(b'{"type":"HEARTBEAT"}\n')
-        assert _read_message(first)["status"] == "HEARTBEAT_OK"
+        assert reader.read()["status"] == "HEARTBEAT_OK"
 
         second = socket.create_connection(("127.0.0.1", gateway.port), timeout=2.0)
         second.settimeout(1.0)
@@ -259,14 +264,22 @@ def test_second_client_is_refused():
         gateway.stop()
 
 
-def _read_message(sock: socket.socket) -> dict:
-    import json
+class WireReader:
+    """Read newline-delimited replies, keeping bytes past the first newline.
 
-    buffer = b""
-    while b"\n" not in buffer:
-        chunk = sock.recv(4096)
-        if not chunk:
-            raise AssertionError("connection closed before a full line arrived")
-        buffer += chunk
-    line, _, _rest = buffer.partition(b"\n")
-    return json.loads(line)
+    A plain recv-per-message helper would drop a second reply that arrived in
+    the same TCP segment, which made the framing tests intermittently hang.
+    """
+
+    def __init__(self, sock: socket.socket) -> None:
+        self._sock = sock
+        self._buffer = b""
+
+    def read(self) -> dict:
+        while b"\n" not in self._buffer:
+            chunk = self._sock.recv(4096)
+            if not chunk:
+                raise AssertionError("connection closed before a full line arrived")
+            self._buffer += chunk
+        line, _, self._buffer = self._buffer.partition(b"\n")
+        return json.loads(line)
