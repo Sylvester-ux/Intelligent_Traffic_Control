@@ -207,6 +207,13 @@ class AppController:
     def set_overlays(self, *, polygon: bool = True, count_line: bool = True) -> None:
         self.orchestrator.set_overlays(polygon=polygon, count_line=count_line)
 
+    def set_camera_overlays(
+        self, camera_id: str, *, polygon: bool = True, count_line: bool = True
+    ) -> None:
+        self.orchestrator.set_camera_overlays(
+            camera_id, polygon=polygon, count_line=count_line
+        )
+
     def set_flip(self, camera_id: str, flip: bool) -> None:
         source = self.orchestrator.sources.get(camera_id)
         if source is not None:

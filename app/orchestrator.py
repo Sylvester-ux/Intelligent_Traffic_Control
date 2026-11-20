@@ -212,6 +212,14 @@ class Orchestrator:
         for pipeline in self.pipelines:
             pipeline.set_overlays(polygon=polygon, count_line=count_line)
 
+    def set_camera_overlays(
+        self, camera_id: str, *, polygon: bool = True, count_line: bool = True
+    ) -> None:
+        for pipeline in self.pipelines:
+            if pipeline.camera_id == camera_id:
+                pipeline.set_overlays(polygon=polygon, count_line=count_line)
+                return
+
     def annotated_frame(self, camera_id: str, max_size: int = 640):
         """Return a downscaled annotated copy, never the full-size buffer."""
         for pipeline in self.pipelines:

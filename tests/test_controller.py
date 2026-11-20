@@ -212,6 +212,22 @@ def test_reset_restarts_gateway_session_and_sequence(tmp_path):
             controller.shutdown()
 
 
+def test_annotated_frame_is_downscaled(tmp_path):
+    with MockGateway(port=0) as gateway:
+        controller, _detector = _controller(tmp_path, gateway)
+        try:
+            controller.start()
+            assert wait_until(
+                lambda: controller.frame("cam_main", max_size=160) is not None,
+                timeout_s=6.0,
+            )
+            frame = controller.frame("cam_main", max_size=160)
+            assert frame is not None
+            assert max(frame.shape[:2]) <= 160
+        finally:
+            controller.shutdown()
+
+
 def test_shutdown_joins_threads_and_flushes(tmp_path):
     with MockGateway(port=0) as gateway:
         controller, _detector = _controller(tmp_path, gateway)

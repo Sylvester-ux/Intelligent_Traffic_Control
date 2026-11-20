@@ -44,6 +44,9 @@ DARK_TOKENS: Mapping[str, str] = MappingProxyType(
         "banner-text": "#14212E",
         "badge-bg": "#3E6787",
         "badge-text": "#FFFFFF",
+        "tile-dim": "#B3090E14",
+        "overlay-panel": "#D9162330",
+        "text-outline": "#0B1118",
     }
 )
 
@@ -77,6 +80,9 @@ LIGHT_TOKENS: Mapping[str, str] = MappingProxyType(
         "banner-text": "#FFFFFF",
         "badge-bg": "#245C86",
         "badge-text": "#FFFFFF",
+        "tile-dim": "#B30B1622",
+        "overlay-panel": "#D91C2933",
+        "text-outline": "#0B1118",
     }
 )
 

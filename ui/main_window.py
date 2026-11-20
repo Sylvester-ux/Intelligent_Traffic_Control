@@ -9,11 +9,13 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
+import cv2
 from PySide6.QtCore import Qt, QSettings, QTimer, QUrl
-from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
+from PySide6.QtGui import QAction, QDesktopServices, QImage, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QFileDialog,
     QDialog,
     QDialogButtonBox,
     QFrame,
@@ -40,6 +42,7 @@ from app.exporters import config_yaml
 from app.snapshots import UiSnapshot
 from ui.dialogs import about_text, confirm
 from ui.theme import DARK, THEMES, stylesheet
+from ui.tiles import CameraTile
 from ui.widgets import (
     CollapsibleSection,
     EmptyTile,
@@ -65,7 +68,11 @@ class MainWindow(QMainWindow):
         self._focused_camera: str | None = None
         self._focus_mode = False
         self._playback_paused = False
-        self._tiles: dict[str, EmptyTile] = {}
+        self._snapshot_warned = False
+        self._tiles: dict[str, CameraTile] = {}
+        self._flip_state = {
+            camera.id: camera.flip for camera in controller.config.cameras
+        }
 
         self.setWindowTitle("Smarti AI Host — Traffic Control Console")
         self.setMinimumSize(1280, 720)
@@ -247,7 +254,18 @@ class MainWindow(QMainWindow):
             "T-JUNCTION   schematic", "Recommendation (advisory)"
         )
         for camera in self.controller.config.cameras:
-            tile = EmptyTile(f"{camera.approach}   {camera.id}")
+            tile = CameraTile(
+                camera.id,
+                camera.approach,
+                camera.source,
+                theme=self.theme,
+            )
+            tile.clicked.connect(self._focus_camera)
+            tile.double_clicked.connect(self._fullscreen_camera)
+            tile.snapshot_requested.connect(self._snapshot_camera)
+            tile.flip_requested.connect(self._toggle_flip)
+            tile.fullscreen_requested.connect(self._fullscreen_camera)
+            tile.overlays_requested.connect(self._set_tile_overlays)
             self._tiles[camera.id] = tile
         self._relayout_tiles()
 
@@ -416,6 +434,9 @@ class MainWindow(QMainWindow):
         self.theme_action.setChecked(name == "light")
         self.theme_action.blockSignals(False)
         self._apply_theme()
+        for tile in self._tiles.values():
+            tile.theme = self.theme
+            tile.update()
         self._refresh_status()
 
     def _theme_toggled(self, light: bool) -> None:
@@ -429,6 +450,7 @@ class MainWindow(QMainWindow):
             if cameras:
                 self._focused_camera = cameras[0]
         self._relayout_tiles()
+        self._update_tile_focus()
 
     def _focus_camera(self, camera_id: str) -> None:
         self._focused_camera = camera_id
@@ -436,6 +458,11 @@ class MainWindow(QMainWindow):
             self.focus_action.setChecked(True)
         else:
             self._relayout_tiles()
+            self._update_tile_focus()
+
+    def _update_tile_focus(self) -> None:
+        for camera_id, tile in self._tiles.items():
+            tile.set_focused(self._focus_mode and camera_id == self._focused_camera)
 
     def _tree_item_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
         camera_id = item.data(0, Qt.ItemDataRole.UserRole)
@@ -444,7 +471,20 @@ class MainWindow(QMainWindow):
 
     def _toggle_overlays(self, enabled: bool) -> None:
         self.controller.set_overlays(polygon=enabled, count_line=enabled)
+        for tile in self._tiles.values():
+            tile.set_overlays_visible(enabled)
+            tile.set_overlay_state(enabled, enabled)
         self.settings.setValue("view/overlays", enabled)
+
+    def _set_tile_overlays(
+        self, camera_id: str, polygon: bool, count_line: bool
+    ) -> None:
+        self.controller.set_camera_overlays(
+            camera_id, polygon=polygon, count_line=count_line
+        )
+        tile = self._tiles.get(camera_id)
+        if tile is not None:
+            tile.set_overlay_state(polygon, count_line)
 
     def _set_logs_visible(self, visible: bool) -> None:
         self.log_dock.setVisible(bool(visible))
@@ -463,6 +503,9 @@ class MainWindow(QMainWindow):
         self.overlays_action.setChecked(enabled)
         self.overlays_action.blockSignals(False)
         self.controller.set_overlays(polygon=enabled, count_line=enabled)
+        for tile in self._tiles.values():
+            tile.set_overlays_visible(enabled)
+            tile.set_overlay_state(enabled, enabled)
         focused = self.settings.value("view/focus", False) in (
             True,
             "true",
@@ -495,7 +538,16 @@ class MainWindow(QMainWindow):
     # -- live updates ------------------------------------------------------
 
     def _refresh_video(self) -> None:
-        """Phase 3 replaces placeholder tiles with live pixmaps."""
+        snapshot = self._snapshot
+        if snapshot is None or not snapshot.started:
+            return
+        for camera in snapshot.cameras:
+            tile = self._tiles.get(camera.camera_id)
+            if tile is None:
+                continue
+            frame = self.controller.frame(camera.camera_id, max_size=960)
+            if frame is not None:
+                tile.set_frame(frame)
 
     def _refresh_panels(self) -> None:
         self._refresh_status()
@@ -589,11 +641,14 @@ class MainWindow(QMainWindow):
 
         for camera in snapshot.cameras:
             tile = self._tiles.get(camera.camera_id)
-            if isinstance(tile, EmptyTile):
-                tile.message.setText(
-                    "Waiting for video"
-                    if not snapshot.started
-                    else f"{camera.state} · {camera.fps:.1f} fps"
+            if tile is not None:
+                tile.set_health(
+                    camera.state,
+                    camera.fps,
+                    camera.frame_age_s,
+                    camera.reconnects,
+                    snapshot.approach(camera.approach),
+                    started=snapshot.started,
                 )
 
     # -- commands ----------------------------------------------------------
@@ -618,6 +673,73 @@ class MainWindow(QMainWindow):
             except Exception as exc:  # noqa: BLE001 - shown to the operator
                 QMessageBox.critical(self, "Could not start", str(exc))
         self._refresh_status()
+
+    def _snapshot_camera(self, camera_id: str) -> None:
+        tile = self._tiles.get(camera_id)
+        if tile is None:
+            return
+        if not self._snapshot_warned:
+            QMessageBox.information(
+                self,
+                "Snapshot privacy",
+                "Camera frames may show people and number plates. "
+                "A snapshot is saved only when you choose to, and exports "
+                "never contain images.",
+            )
+            self._snapshot_warned = True
+        default = f"snapshot_{tile.approach}_{datetime.now():%Y%m%d_%H%M%S}.png"
+        path, _filter = QFileDialog.getSaveFileName(
+            self, "Save tile snapshot", default, "PNG image (*.png)"
+        )
+        if not path:
+            return
+        if not tile.grab().save(path):
+            QMessageBox.warning(self, "Snapshot failed", f"Could not write {path}")
+
+    def _toggle_flip(self, camera_id: str) -> None:
+        new_state = not self._flip_state.get(camera_id, False)
+        self._flip_state[camera_id] = new_state
+        self.controller.set_flip(camera_id, new_state)
+
+    def _fullscreen_camera(self, camera_id: str) -> None:
+        tile = self._tiles.get(camera_id)
+        if tile is None:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"{tile.approach} — {camera_id}")
+        dialog.setWindowState(Qt.WindowState.WindowFullScreen)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(0, 0, 0, 0)
+        label = QLabel()
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setStyleSheet(
+            f"background-color: {self.theme.tokens['bg-field']};"
+        )
+        layout.addWidget(label)
+
+        def update() -> None:
+            frame = self.controller.frame(camera_id, max_size=1600)
+            if frame is None:
+                return
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            height, width = rgb.shape[:2]
+            image = QImage(
+                rgb.data, width, height, 3 * width, QImage.Format.Format_RGB888
+            ).copy()
+            pixmap = QPixmap.fromImage(image).scaled(
+                label.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            label.setPixmap(pixmap)
+
+        timer = QTimer(dialog)
+        timer.setInterval(100)
+        timer.timeout.connect(update)
+        timer.start()
+        update()
+        dialog.exec()
+        timer.stop()
 
     def _toggle_playback(self) -> None:
         self._playback_paused = not self._playback_paused

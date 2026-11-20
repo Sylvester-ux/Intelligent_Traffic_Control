@@ -6,6 +6,7 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import numpy as np
 import pytest
 from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
@@ -14,6 +15,8 @@ from app.config import build_config
 from app.controller import AppController
 from ui.dialogs import build_confirm
 from ui.main_window import MainWindow
+from ui.theme import DARK
+from ui.tiles import CameraTile
 
 
 @pytest.fixture(scope="session")
@@ -107,6 +110,23 @@ def test_consequence_dialogs_default_to_cancel(qt_app):
         assert box.escapeButton().text() == "Cancel"
     finally:
         box.deleteLater()
+
+
+def test_camera_tile_tracks_health_and_paints(qt_app):
+    tile = CameraTile("cam", "MAIN", "file", theme=DARK)
+    tile.resize(640, 360)
+    tile.set_health("LIVE", 8.0, 0.1, 0, started=True)
+    tile.set_frame(np.zeros((240, 320, 3), dtype=np.uint8))
+    assert tile.status_word() == "LIVE"
+    assert tile.has_frame()
+    assert not tile.grab().isNull()
+
+    tile.set_health("DISCONNECTED", 0.0, 3.2, 2, started=True)
+    assert tile.status_word() == "DISCONNECTED"
+    assert not tile.grab().isNull()
+
+    tile.set_health("LIVE", 0.0, None, 0, started=False)
+    assert tile.status_word() == "STOPPED"
 
 
 def test_sidebar_sections_collapse_and_persist(qt_app, tmp_path):
