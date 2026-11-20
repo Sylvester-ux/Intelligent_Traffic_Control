@@ -1,0 +1,180 @@
+# Operator GUI design
+
+Phase 0 deliverable for the optional PySide6 operator layer. Nothing here
+changes decision behaviour, the wire protocol or the health policy. The GUI is
+read-only with respect to the controller: it sends advisory requests through
+the existing client and can close the heartbeat gate, never open it.
+
+## 1. Reference image and licensing
+
+The brief describes a licensed Shutterstock "surveillance system" thumbnail.
+**No reference image is present in this repository.** `docs/ui/` did not exist,
+so there was nothing to view, copy or compare. No Shutterstock asset was
+downloaded, embedded or committed, and the app uses no stock media.
+
+`.gitignore` ignores `docs/ui/reference.*` so a user-supplied reference cannot
+be committed by accident. Screenshots produced by this project are our own and
+may be committed under `docs/ui/`.
+
+## 2. PySide6 check (Phase 0 gate)
+
+| Check | Result |
+| --- | --- |
+| Python | 3.14.7 (`.venv/Scripts/python.exe`) |
+| Wheel | `PySide6 6.12.0` (`cp310-abi3-win_amd64`) installed from PyPI |
+| Import | OK |
+| Offscreen window | `QT_QPA_PLATFORM=offscreen` created a `QApplication` and a screen |
+
+On this Windows install Qt prints `QFontDatabase: Cannot find font directory`
+when running offscreen because Qt no longer bundles fonts. It is a warning, not
+a failure; system fonts are used. No web font, icon pack, CDN or network call is
+used by the UI. PySide6 is the only added dependency.
+
+## 3. Orchestrator and pipeline audit (what the GUI may read)
+
+The GUI must not reach into pipeline internals. The audit found these usable
+seams and the smallest additions needed:
+
+| Need | Existing | Added hook |
+| --- | --- | --- |
+| Camera health | `CameraManager.health_all()` | read-only accessor on the controller |
+| Latest metrics | `CameraPipeline.latest_metrics()` | controller snapshot |
+| Annotated frame | `CameraPipeline.latest_annotated()` copies the full frame | `latest_annotated(max_size)` downscales before returning |
+| Decision record | `tick()` builds the JSONL entry | optional `on_tick(entry)` callback, wrapped so a slow/broken GUI cannot break the loop |
+| Gate state/reason | `health_gate_open()`, gate transition log | last reason retained for the status tooltip |
+| Requests held | none | `hold_requests()` / `resume_requests()`; decisions still logged with `request.reason = operator_hold` |
+| Operator release | none | `release_to_autonomous()` forces the existing gate closed; `resume_control()` restores normal gating |
+| Reset | `DecisionEngine.reset()` | `request_reset()` processed at the top of the next tick: engine + pipeline state reset and gateway session restart |
+| File playback | none | `FileSource.pause()/resume()/restart()/set_speed()`; files only, testing aid |
+| Pipeline overlay toggles | `annotate` fixed at construction | `CameraPipeline.set_overlays(polygon, count_line)` |
+| Frame flip | `ThreadedFrameSource.flip` | setter used by the tile flip action |
+
+Why a per-tick callback rather than polling the JSONL: the log may be disabled
+or rotated, and the UI needs the exact decision the engine produced. The
+callback runs on the decision thread, so it only copies the record into a
+bounded queue; it never touches Qt.
+
+Reset is deferred to the next tick on purpose. Calling `DecisionEngine.reset()`
+from the GUI thread while `evaluate()` runs would race the smoothing deques.
+The same rule applies to release/hold: they only flip thread-safe flags.
+
+Annotation is enabled for the GUI even without `--display`, but no OpenCV window
+is created. The existing `--display` path and headless `run()` are unchanged.
+
+## 4. What was adopted, adapted or skipped
+
+| Reference element | Decision |
+| --- | --- |
+| Title bar + menu bar | Adopted. File / View / Cameras / Log / Settings / Help; mode badge at the right. |
+| Account / Login | Skipped; replaced by the mode / simulation badge. |
+| 3 x 3 dense grid | Adapted to 2 x 2 with 2 px gaps: MAIN, SEC_A, SEC_B and the T-junction schematic. Focus mode gives one large tile plus two small. |
+| Tile name + LIVE label | Adopted; health badge is icon + word (LIVE / STALE / DISCONNECTED / CONNECTING). Red is reserved for faults, so LIVE is green, not red. |
+| Corner telemetry | Adopted with the same four corners, monospace with a dark outline; View > Overlays hides them. |
+| Right sidebar sections | Adopted: System, Live Events, Playback, Camera List, Controls. |
+| Playback transport + speed | Adapted for file sources only, labelled testing aid. Hidden for RTSP and webcam. |
+| PTZ, numbered 1-6 buttons | Skipped: cameras are fixed. |
+| Bottom START + session timer | Adopted: Start/Stop left, timer centred, status chips right. |
+| Hospital footage / camera names | Replaced by real approaches and live frames. |
+
+Deliberate deviations from the reference: a fourth schematic tile instead of a
+ninth camera, health words instead of a red LIVE dot, no account area, no
+decorative motion, and a warning-coloured simulation banner.
+
+## 5. Colour tokens
+
+All colours live in `ui/theme.py`; no colour literal appears outside it. Values
+are the brief's sampled chrome, with the following **AA adjustments** found by
+computing the pairs:
+
+| Token | Dark value | Adjustment |
+| --- | --- | --- |
+| `bg-chrome` | `#1C323C` | as supplied |
+| `bg-base` | `#222B38` | as supplied |
+| `bg-panel` | `#2A3846` | as supplied |
+| `bg-panel-raised` | `#32424E` | as supplied |
+| `bg-field` | `#1A202F` | as supplied |
+| `border` | `#425560` | as supplied |
+| `text-primary` | `#D3DDE6` | 7.5:1 or better everywhere |
+| `text-secondary` | `#A6B2BF` | lightened from `#97A4B2`, which was 4.08:1 on raised |
+| `text-muted` | `#6B7D8B` | decorative/disabled only |
+| `accent` | `#3E6787` | white label is 6.0:1 |
+| `accent-text` | `#7FB3D5` | 5.9:1 on chrome, 4.6:1 on raised |
+| `selection` | `#1A2A47` | selection uses `accent-text` for the label |
+| `status-ok` | `#5ACBA3` | lightened; 5.2:1 on raised, 6.0:1 on panel |
+| `status-warn` | `#E5B84A` | 5.6:1 on raised |
+| `status-critical` | `#F06A6E` | icons/large text; 3.45:1 on raised (3:1 UI) |
+| `status-critical-text` | `#FF8A8D` | 4.6:1 on raised, 5.3:1 on panel |
+| `status-unknown` | `#A6B2BF` | lightened; grey + word, 4.8:1 on raised |
+| `approach-main` | `#5CC8D8` | 5.3:1 on raised |
+| `approach-sec-a` | `#C4B5FD` | lightened from `#A78BFA`, which was 3.81:1 on raised |
+| `approach-sec-b` | `#F4A3C0` | 6.2:1 on panel |
+| `focus-ring` | `#93C5FD` | 5.8:1 on raised |
+
+Measured body-text contrast (WCAG 2.1): primary 7.53-11.81, secondary
+4.72-6.40, accent-text 4.60-7.21, status-ok 4.09→5.19 after adjustment,
+status-warn 5.57-8.74, critical-text 4.58-7.18. `text-muted` remains below AA
+and is documented as decorative only, never used for status or body copy.
+`status-unknown` uses the lightened secondary value because the previous
+`#6B7D8B` was 2.44:1 on raised.
+
+Light theme: `bg-base #EEF2F5`, `bg-panel #FFFFFF`, `bg-field #F4F7FA`,
+`border #CBD5DF`, `text-primary #14212E` (14.5:1), `text-secondary #46576A`
+(6.6:1), status hues darkened to `#0F6B4F` (5.8:1), `#7A5A00` (5.7:1) and
+`#B3261E` (5.8:1) on the base. Selection uses `#DCE7F2`.
+
+Approach identity colours are cyan/violet/pink, never red, green or amber, so
+they cannot be mistaken for a status or a physical signal aspect.
+
+## 6. Typography, spacing, shape
+
+- UI: Segoe UI, fallbacks Inter then generic sans. Logs and JSON: Cascadia Mono,
+  Consolas, generic monospace. No downloaded fonts.
+- 11 px helper, 13 px body, 15 px section titles, 20 px large readouts.
+  Tabular numerals for metrics.
+- 8-pt spacing grid; 10 px cards; 6 px buttons; 40 px minimum control height.
+- Primary = accent fill with white text; secondary = outline; destructive =
+  critical outline (fills only inside confirmation); caution = warn outline for
+  Release.
+- Every icon button carries text or a tooltip; focus ring is 2 px.
+
+## 7. Operator-safety rules encoded in the UI
+
+- Recommendations and expected red are always labelled advisory/derived.
+- The UI never claims a lamp changed; it shows the last recommendation and the
+  controller's reply.
+- Missing data is "unknown" (grey + word), never an optimistic default.
+- Destructive actions (Stop, Reset, Release, Shutdown) confirm, state the
+  consequence in one sentence and default to Cancel.
+- Simulation (mock gateway, dry run or three-phase) shows a persistent amber
+  banner and mode badge.
+- Snapshots are explicit-click only, warn once about people/plates, and are
+  never written automatically. Exports contain no images.
+- No sounds by default; reduced motion removes pulsing and any animation.
+- About states: "Advisory research prototype. Not validated on hardware or
+  approved for public roads."
+
+## 8. Layout and interaction
+
+Minimum 1280 x 720, resizable; video area ~80% width, sidebar ~20%. The title
+bar, menu bar and status bar never scroll away. Sidebar sections are collapsible
+triangles whose state persists through `QSettings`, as do window geometry,
+theme, overlay visibility and reduced motion.
+
+- 10 fps for video tiles (downscaled copies), 2-4 Hz for tables/panels.
+- Log ring buffer 5,000 lines, inserted in batches; decisions table capped too.
+- UI actions run exports and shutdown in worker threads; the decision loop and
+  gateway heartbeat never wait on the GUI.
+- Keyboard: visible focus, logical tab order, shortcuts on every control
+  (Ctrl+E export, Ctrl+R reset, Ctrl+Q shutdown, F5 start/stop, F11 focus).
+
+## 9. Phase plan
+
+0. This document, dependency and orchestrator audit.
+1. `app/controller.py`, `UiSnapshot`, event feed, `LogBroadcaster`, exporters,
+   orchestrator/pipeline/file-source hooks; Qt-free tests.
+2. `ui/theme.py`, shell, menu bar, status bar, collapsible sidebar, empty grid.
+3. Camera tiles, overlays, health/NO SIGNAL, Grid/Focus; fps measurement.
+4. Schematic, metric cards, last decision and reasons.
+5. Live log and decisions table with filters, search and caps.
+6. Controls, confirmations, worker exports, diagnostics, shortcuts.
+7. Accessibility/polish, light theme, persisted layout, README and screenshots.

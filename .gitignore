@@ -47,3 +47,6 @@ data/processed/
 
 # Agent tooling
 .freebuff/
+
+# User-supplied licensed UI reference; never commit stock media
+docs/ui/reference.*
