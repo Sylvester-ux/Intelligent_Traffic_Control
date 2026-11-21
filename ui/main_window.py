@@ -6,19 +6,19 @@ It never imports the core packages directly.
 
 from __future__ import annotations
 
+import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
-import cv2
 from PySide6.QtCore import Qt, QSettings, QThreadPool, QTimer, QUrl
 from PySide6.QtGui import (
     QAction,
+    QActionGroup,
     QBrush,
     QColor,
     QDesktopServices,
-    QImage,
     QKeySequence,
-    QPixmap,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -91,6 +91,17 @@ class MainWindow(QMainWindow):
         self._flip_state = {
             camera.id: camera.flip for camera in controller.config.cameras
         }
+        self._preview_enabled = True
+        self._preview_fps = 5.0
+        self._preview_scale = 0.5
+        self._last_video_at = 0.0
+        self._last_panel_at = 0.0
+        self._last_status_at = 0.0
+        self._frame_versions: dict[str, int] = {}
+        self._frames_painted = 0
+        self._paint_times: deque[float] = deque(maxlen=400)
+        self._dock_maximized = False
+        self._dock_saved_sizes: list[int] = []
 
         self.setWindowTitle("Smarti AI Host — Traffic Control Console")
         self.setMinimumSize(1280, 720)
@@ -101,15 +112,12 @@ class MainWindow(QMainWindow):
         self._apply_theme()
         self._restore_layout()
 
-        self._panel_timer = QTimer(self)
-        self._panel_timer.setInterval(250)
-        self._panel_timer.timeout.connect(self._refresh_panels)
-        self._panel_timer.start()
-
-        self._video_timer = QTimer(self)
-        self._video_timer.setInterval(100)
-        self._video_timer.timeout.connect(self._refresh_video)
-        self._video_timer.start()
+        # One scheduler for video, panels and status chips. Individual widgets
+        # never own timers, so hidden/minimised windows do no work.
+        self._scheduler_timer = QTimer(self)
+        self._scheduler_timer.setInterval(50)
+        self._scheduler_timer.timeout.connect(self._scheduler_tick)
+        self._scheduler_timer.start()
 
         self._refresh_status()
 
@@ -166,6 +174,26 @@ class MainWindow(QMainWindow):
         self.logs_action.setChecked(True)
         self.logs_action.toggled.connect(self._set_logs_visible)
 
+        self.preview_action = QAction("Video preview", self)
+        self.preview_action.setCheckable(True)
+        self.preview_action.setChecked(True)
+        self.preview_action.setToolTip(
+            "Stop converting and painting camera frames; logs and decisions continue"
+        )
+        self.preview_action.toggled.connect(self.set_video_preview)
+
+        self.preview_quality_group = QActionGroup(self)
+        self.preview_quality_actions: dict[str, QAction] = {}
+        for key, label in (("low", "Low (4 fps)"), ("medium", "Medium (8 fps)"), ("high", "High (12 fps)")):
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setData(key)
+            action.triggered.connect(
+                lambda _checked=False, quality=key: self.set_preview_quality(quality)
+            )
+            self.preview_quality_group.addAction(action)
+            self.preview_quality_actions[key] = action
+
         self.theme_action = QAction("Light theme", self)
         self.theme_action.setCheckable(True)
         self.theme_action.setChecked(self.theme.name == "light")
@@ -201,45 +229,28 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        outer.addWidget(self._build_title_bar())
         self._build_menus()
 
-        self.banner = QLabel("")
-        self.banner.setObjectName("banner")
-        self.banner.setVisible(False)
-        outer.addWidget(self.banner)
+        self.work_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.work_splitter.setChildrenCollapsible(False)
+        self.work_splitter.addWidget(self._build_video_area())
+        self.log_dock = self._build_log_dock()
+        self.work_splitter.addWidget(self.log_dock)
+        self.work_splitter.setStretchFactor(0, 3)
+        self.work_splitter.setStretchFactor(1, 2)
+        self.work_splitter.setSizes([348, 312])
 
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.splitter.setChildrenCollapsible(False)
-        self.splitter.addWidget(self._build_video_area())
+        self.splitter.addWidget(self.work_splitter)
         self.splitter.addWidget(self._build_sidebar())
         self.splitter.setStretchFactor(0, 4)
         self.splitter.setStretchFactor(1, 1)
-        self.splitter.setSizes([1120, 320])
+        self.splitter.setSizes([1050, 300])
         outer.addWidget(self.splitter, 1)
 
         self.setCentralWidget(central)
         self._build_status_bar()
-
-    def _build_title_bar(self) -> QWidget:
-        bar = QFrame()
-        bar.setObjectName("titleBar")
-        bar.setFixedHeight(38)
-        layout = QHBoxLayout(bar)
-        layout.setContentsMargins(10, 4, 10, 4)
-        layout.setSpacing(8)
-        icon = QLabel("S")
-        icon.setObjectName("appIcon")
-        title = QLabel("SMARTI AI HOST — TRAFFIC CONTROL CONSOLE")
-        title.setObjectName("appTitle")
-        layout.addWidget(icon)
-        layout.addStretch(1)
-        layout.addWidget(title)
-        layout.addStretch(1)
-        spacer = QLabel("  ")
-        spacer.setFixedWidth(icon.sizeHint().width())
-        layout.addWidget(spacer)
-        return bar
 
     def _build_menus(self) -> None:
         menu = self.menuBar()
@@ -260,6 +271,10 @@ class MainWindow(QMainWindow):
         view_menu = menu.addMenu("View")
         view_menu.addAction(self.focus_action)
         view_menu.addAction(self.overlays_action)
+        view_menu.addAction(self.preview_action)
+        quality_menu = view_menu.addMenu("Preview quality")
+        for action in self.preview_quality_actions.values():
+            quality_menu.addAction(action)
         view_menu.addAction(self.theme_action)
         view_menu.addSeparator()
         view_menu.addAction(self.logs_action)
@@ -281,8 +296,12 @@ class MainWindow(QMainWindow):
         help_menu = menu.addMenu("Help")
         help_menu.addAction(self.about_action)
 
-        self.mode_badge = QLabel("COMPAT TWO PHASE")
+        self.mode_badge = QLabel("LIVE:COMPAT-2PH")
         self.mode_badge.setObjectName("modeBadge")
+        self.mode_badge.setAccessibleName("Operating mode")
+        self.mode_badge.setToolTip(
+            "Shows whether this host is live or simulated. Simulation is never hidden."
+        )
         menu.setCornerWidget(self.mode_badge, Qt.Corner.TopRightCorner)
 
     def _build_video_area(self) -> QWidget:
@@ -301,18 +320,22 @@ class MainWindow(QMainWindow):
             self.grid_layout.setRowStretch(row, 1)
 
         self._build_tiles()
+        self.grid_host.setMinimumHeight(0)
         layout.addWidget(self.grid_host, 1)
+        return holder
 
-        self.log_dock = QFrame()
-        self.log_dock.setObjectName("card")
-        self.log_dock.setMinimumHeight(150)
-        self.log_dock.setMaximumHeight(280)
-        dock_layout = QVBoxLayout(self.log_dock)
-        dock_layout.setContentsMargins(4, 4, 4, 4)
+    def _build_log_dock(self) -> QWidget:
+        dock = QFrame()
+        dock.setObjectName("card")
+        dock.setMinimumHeight(312)
+        dock_layout = QVBoxLayout(dock)
+        dock_layout.setContentsMargins(2, 0, 2, 2)
         self.log_panel = LogPanel(self.theme)
         dock_layout.addWidget(self.log_panel)
-        layout.addWidget(self.log_dock, 0)
-        return holder
+        self.log_panel.tabBar().tabBarDoubleClicked.connect(
+            self._toggle_dock_maximized
+        )
+        return dock
 
     def _build_tiles(self) -> None:
         self.schematic_tile = SchematicTile(
@@ -333,10 +356,8 @@ class MainWindow(QMainWindow):
             )
             tile.setAccessibleName(f"{camera.approach} camera {camera.id}")
             tile.clicked.connect(self._focus_camera)
-            tile.double_clicked.connect(self._fullscreen_camera)
             tile.snapshot_requested.connect(self._snapshot_camera)
             tile.flip_requested.connect(self._toggle_flip)
-            tile.fullscreen_requested.connect(self._fullscreen_camera)
             tile.overlays_requested.connect(self._set_tile_overlays)
             self._tiles[camera.id] = tile
         self._relayout_tiles()
@@ -366,7 +387,7 @@ class MainWindow(QMainWindow):
     def _build_sidebar(self) -> QWidget:
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setMinimumWidth(300)
+        scroll.setMinimumWidth(280)
         scroll.setMaximumWidth(430)
         sidebar = QWidget()
         layout = QVBoxLayout(sidebar)
@@ -580,14 +601,11 @@ class MainWindow(QMainWindow):
         self.camera_chip = StatusChip("0/0 cameras", "unknown")
         self.gateway_chip = StatusChip("Gateway unknown", "unknown")
         self.gate_chip = StatusChip("Gate CLOSED", "critical")
-        self.dry_chip = StatusChip("DRY RUN", "info")
-        self.dry_chip.setVisible(False)
         self.clock_chip = StatusChip("--:--:--", "info")
         for chip in (
             self.camera_chip,
             self.gateway_chip,
             self.gate_chip,
-            self.dry_chip,
             self.clock_chip,
         ):
             bar.addPermanentWidget(chip)
@@ -688,6 +706,11 @@ class MainWindow(QMainWindow):
         splitter = self.settings.value("window/splitter")
         if splitter:
             self.splitter.restoreState(splitter)
+        work_splitter = self.settings.value("window/work_splitter")
+        if work_splitter:
+            self.work_splitter.restoreState(work_splitter)
+        else:
+            self.work_splitter.setSizes([348, 312])
         overlays = self.settings.value("view/overlays", True)
         enabled = overlays in (True, "true", "True", "1", 1)
         self.overlays_action.blockSignals(True)
@@ -729,37 +752,134 @@ class MainWindow(QMainWindow):
         self.reduced_motion_action.blockSignals(False)
         self._reduced_motion = reduced
 
+        preview = self.settings.value("view/preview", True) in (
+            True,
+            "true",
+            "True",
+            "1",
+            1,
+        )
+        default_quality = {
+            "low": "low",
+            "balanced": "medium",
+            "high": "high",
+        }.get(self.controller.config.performance.profile, "low")
+        quality = str(
+            self.settings.value("view/preview_quality", default_quality)
+        ).lower()
+        if quality not in ("low", "medium", "high"):
+            quality = default_quality
+        self.preview_action.blockSignals(True)
+        self.preview_action.setChecked(preview)
+        self.preview_action.blockSignals(False)
+        self.set_preview_quality(quality, persist=False)
+        self.set_video_preview(preview, persist=False)
+
     def _save_layout(self) -> None:
         self.settings.setValue("window/geometry", self.saveGeometry())
         self.settings.setValue("window/splitter", self.splitter.saveState())
+        if not self._dock_maximized:
+            self.settings.setValue(
+                "window/work_splitter", self.work_splitter.saveState()
+            )
         self.settings.setValue("theme", self.theme.name)
         self.settings.setValue("view/focus", self._focus_mode)
         self.settings.setValue("view/overlays", self.overlays_action.isChecked())
         self.settings.setValue("view/logs", self.logs_action.isChecked())
+        self.settings.setValue("view/preview", self._preview_enabled)
+        self.settings.setValue("view/preview_quality", self._preview_quality)
         self.settings.setValue(
             "view/reduced_motion", self.reduced_motion_action.isChecked()
         )
 
+    def set_video_preview(self, enabled: bool, *, persist: bool = True) -> None:
+        self._preview_enabled = bool(enabled)
+        if persist:
+            self.settings.setValue("view/preview", self._preview_enabled)
+        for tile in self._tiles.values():
+            tile.set_preview_enabled(self._preview_enabled)
+        if self._preview_enabled:
+            self._last_video_at = 0.0
+
+    def set_preview_quality(self, quality: str, *, persist: bool = True) -> None:
+        settings = {
+            "low": (4.0, 0.5),
+            "medium": (8.0, 0.75),
+            "high": (12.0, 1.0),
+        }
+        key = quality if quality in settings else "low"
+        self._preview_quality = key
+        self._preview_fps, self._preview_scale = settings[key]
+        action = self.preview_quality_actions.get(key)
+        if action is not None:
+            action.setChecked(True)
+        if persist:
+            self.settings.setValue("view/preview_quality", key)
+
+    def _toggle_dock_maximized(self, _index: int = -1) -> None:
+        if self._dock_maximized:
+            self.grid_host.setVisible(True)
+            if self._dock_saved_sizes:
+                self.work_splitter.setSizes(self._dock_saved_sizes)
+        else:
+            self._dock_saved_sizes = self.work_splitter.sizes()
+            self.grid_host.setVisible(False)
+        self._dock_maximized = not self._dock_maximized
+
     # -- live updates ------------------------------------------------------
+
+    def _scheduler_tick(self) -> None:
+        if self.isMinimized() or not self.isVisible():
+            return
+        now = time.monotonic()
+        if self._preview_enabled and now - self._last_video_at >= 1.0 / self._preview_fps:
+            self._last_video_at = now
+            self._refresh_video()
+        if now - self._last_panel_at >= 0.25:
+            self._last_panel_at = now
+            self._refresh_panels()
+        if now - self._last_status_at >= 1.0:
+            self._last_status_at = now
+            self._refresh_status()
 
     def _refresh_video(self) -> None:
         snapshot = self._snapshot
-        if snapshot is None or not snapshot.started:
+        if not self._preview_enabled or snapshot is None or not snapshot.started:
             return
         for camera in snapshot.cameras:
             tile = self._tiles.get(camera.camera_id)
-            if tile is None:
+            if tile is None or not tile.isVisible():
                 continue
-            frame = self.controller.frame(camera.camera_id, max_size=960)
-            if frame is not None:
-                tile.set_frame(frame)
+            max_size = max(
+                160, int(tile.video_max_size() * self._preview_scale)
+            )
+            version = self._frame_versions.get(camera.camera_id, 0)
+            frame = self.controller.frame(
+                camera.camera_id, max_size=max_size, if_version=version
+            )
+            if frame is None:
+                continue
+            new_version = self.controller.frame_version(camera.camera_id)
+            if tile.set_frame(frame, frame_index=new_version):
+                self._frame_versions[camera.camera_id] = new_version
+                self._frames_painted += 1
+                self._paint_times.append(time.monotonic())
+
+    def _ui_render_fps(self) -> float:
+        now = time.monotonic()
+        while self._paint_times and now - self._paint_times[0] > 2.0:
+            self._paint_times.popleft()
+        if len(self._paint_times) < 2:
+            return 0.0
+        span = max(0.001, self._paint_times[-1] - self._paint_times[0])
+        return round((len(self._paint_times) - 1) / span, 1)
 
     def _refresh_panels(self) -> None:
         lines, self._log_seq = self.controller.log_lines(self._log_seq)
         if lines:
             self.log_panel.append_logs(lines)
-        self.log_panel.set_decisions(self.controller.decisions())
-        self._refresh_status()
+        if self.log_panel.isVisible():
+            self.log_panel.set_decisions(self.controller.decisions())
         self._refresh_events()
 
     def _refresh_events(self) -> None:
@@ -826,6 +946,15 @@ class MainWindow(QMainWindow):
             f"{snapshot.fresh_cameras}/{snapshot.required_cameras} cameras", tone
         )
 
+        badge_text, badge_tone, badge_tip = mode_badge_state(snapshot)
+        if self.mode_badge.text() != badge_text:
+            self.mode_badge.setText(badge_text)
+        if self.mode_badge.property("tone") != badge_tone:
+            self.mode_badge.setProperty("tone", badge_tone)
+            self.mode_badge.style().unpolish(self.mode_badge)
+            self.mode_badge.style().polish(self.mode_badge)
+        self.mode_badge.setToolTip(badge_tip)
+
         gateway_tone = {
             "CONNECTED": "ok",
             "CONNECTING": "unknown",
@@ -850,42 +979,39 @@ class MainWindow(QMainWindow):
             gate_tone,
             snapshot.gate_reason,
         )
-        self.dry_chip.setVisible(bool(snapshot.dry_run))
         self.clock_chip.set_state(datetime.now().strftime("%H:%M:%S"), "info")
-
-        if snapshot.simulation:
-            parts = []
-            if snapshot.dry_run:
-                parts.append("dry run")
-            if snapshot.mock_gateway:
-                parts.append("mock gateway")
-            if snapshot.three_phase:
-                parts.append("three-phase proposal")
-            detail = ", ".join(parts) or "simulation"
-            self.banner.setText(
-                f"SIMULATION: {detail}. Not connected to real hardware."
-            )
-            self.banner.setVisible(True)
-            self.mode_badge.setText("SIMULATION")
-        else:
-            self.banner.setVisible(False)
-            self.mode_badge.setText(snapshot.mode.replace("_", " ").upper())
 
         fps = ", ".join(
             f"{camera.approach} {camera.fps:.1f}" for camera in snapshot.cameras
         )
+        processing = []
+        for camera in snapshot.cameras:
+            line = (
+                f"{camera.approach}: {camera.processed_fps:.1f} fps "
+                f"{camera.inference_ms:.0f} ms"
+            )
+            if camera.dropped_frames:
+                line += f" · {camera.dropped_frames} dropped"
+            if camera.overloaded:
+                line += f" · overloaded: reduced to {camera.effective_fps:.0f} fps"
+            processing.append(line)
         self.system_label.setText(
             "\n".join(
                 [
                     f"Mode: {snapshot.mode}",
+                    f"Profile: {snapshot.performance_profile}",
                     f"Gateway: {snapshot.gateway_host}:{snapshot.gateway_port} "
                     f"({snapshot.gateway_state})",
                     f"Heartbeat gate: {'OPEN' if snapshot.gate_open else 'CLOSED'}",
                     f"Reason: {snapshot.gate_reason}",
-                    f"Device: {self.controller.config.detection.device}",
+                    f"Device: {self.controller.config.detection.device} · "
+                    f"imgsz {self.controller.config.performance.imgsz}",
                     f"Camera fps: {fps or 'no data'}",
-                    f"CPU: {_percent(snapshot.cpu_percent)}   "
-                    f"Memory: {_percent(snapshot.memory_percent)}",
+                    *processing,
+                    f"App CPU: {_percent(snapshot.app_cpu_percent)}   "
+                    f"RSS: {'unknown' if snapshot.app_memory_mb is None else f'{snapshot.app_memory_mb:.0f} MB'}",
+                    f"UI render: {self._ui_render_fps():.1f} fps   "
+                    f"System memory: {_percent(snapshot.memory_percent)}",
                     f"Uptime: {format_uptime(snapshot.uptime_s)}",
                 ]
             )
@@ -987,46 +1113,6 @@ class MainWindow(QMainWindow):
         new_state = not self._flip_state.get(camera_id, False)
         self._flip_state[camera_id] = new_state
         self.controller.set_flip(camera_id, new_state)
-
-    def _fullscreen_camera(self, camera_id: str) -> None:
-        tile = self._tiles.get(camera_id)
-        if tile is None:
-            return
-        dialog = QDialog(self)
-        dialog.setWindowTitle(f"{tile.approach} — {camera_id}")
-        dialog.setWindowState(Qt.WindowState.WindowFullScreen)
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(0, 0, 0, 0)
-        label = QLabel()
-        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        label.setStyleSheet(
-            f"background-color: {self.theme.tokens['bg-field']};"
-        )
-        layout.addWidget(label)
-
-        def update() -> None:
-            frame = self.controller.frame(camera_id, max_size=1600)
-            if frame is None:
-                return
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            height, width = rgb.shape[:2]
-            image = QImage(
-                rgb.data, width, height, 3 * width, QImage.Format.Format_RGB888
-            ).copy()
-            pixmap = QPixmap.fromImage(image).scaled(
-                label.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            label.setPixmap(pixmap)
-
-        timer = QTimer(dialog)
-        timer.setInterval(100)
-        timer.timeout.connect(update)
-        timer.start()
-        update()
-        dialog.exec()
-        timer.stop()
 
     def _toggle_hold(self) -> None:
         if self.controller.held:
@@ -1266,6 +1352,40 @@ class MainWindow(QMainWindow):
             pass
         self._save_layout()
         super().closeEvent(event)
+
+
+def mode_badge_state(snapshot: UiSnapshot) -> tuple[str, str, str]:
+    """Return ``(STATE:DETAIL, tone, tooltip)`` for the single mode badge."""
+    if snapshot.dry_run:
+        return (
+            "SIMULATION:DRY-RUN",
+            "simulation",
+            "Dry run: decisions and logs only. No gateway or hardware is connected.",
+        )
+    if snapshot.mock_gateway:
+        return (
+            "SIMULATION:MOCK-GATEWAY",
+            "simulation",
+            "Loopback mock gateway. Not connected to real firmware or lamps.",
+        )
+    if snapshot.three_phase:
+        return (
+            "SIMULATION:THREE-PHASE",
+            "simulation",
+            "Three-phase proposal only: the required firmware does not exist.",
+        )
+    if snapshot.file_sources:
+        return (
+            "SIMULATION:FILE-SOURCES",
+            "simulation",
+            "A real gateway is configured, but at least one camera is a video file, not a live camera.",
+        )
+    detail = "COMPAT-2PH" if snapshot.mode == "compat_two_phase" else snapshot.mode.upper().replace("_", "-")
+    return (
+        f"LIVE:{detail}",
+        "live",
+        "Live camera sources with a real gateway connection. Advisory only.",
+    )
 
 
 def _percent(value: float | None) -> str:

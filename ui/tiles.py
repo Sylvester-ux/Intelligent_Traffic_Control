@@ -6,7 +6,7 @@ from typing import Optional
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QPoint, QRect, Qt, Signal
+from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen
 from PySide6.QtWidgets import QFrame, QMenu
 
@@ -31,10 +31,8 @@ class CameraTile(QFrame):
     """A camera input styled like the reference tile, with honest status."""
 
     clicked = Signal(str)
-    double_clicked = Signal(str)
     snapshot_requested = Signal(str)
     flip_requested = Signal(str)
-    fullscreen_requested = Signal(str)
     overlays_requested = Signal(str, bool, bool)
 
     def __init__(
@@ -54,6 +52,9 @@ class CameraTile(QFrame):
         self.theme = theme
         self._mono = font_family
         self._image: Optional[QImage] = None
+        self._image_buffer: Optional[np.ndarray] = None
+        self._last_frame_index: Optional[int] = None
+        self._rendered_frames = 0
         self._state = "CONNECTING"
         self._fps = 0.0
         self._age: Optional[float] = None
@@ -64,24 +65,65 @@ class CameraTile(QFrame):
         self._overlays = True
         self._show_polygon = True
         self._show_line = True
-        self.setMinimumSize(320, 180)
+        self._scaled_image: Optional[QImage] = None
+        self._scaled_for: Optional[QSize] = None
+        self._preview_enabled = True
+        self.setMinimumSize(260, 108)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._context_menu)
 
     # -- data --------------------------------------------------------------
 
-    def set_frame(self, frame: np.ndarray) -> None:
-        """Store a downscaled BGR copy as a QImage."""
-        if frame is None or frame.size == 0:
-            return
+    def set_frame(self, frame: np.ndarray, frame_index: Optional[int] = None) -> bool:
+        """Store a BGR frame without a second full-frame copy.
+
+        ``latest_annotated`` returns a fresh array that is never mutated after
+        publication; keeping that buffer alive lets QImage wrap it directly.
+        """
+        if frame is None or frame.size == 0 or not self._preview_enabled:
+            return False
+        if frame_index is not None and frame_index == self._last_frame_index:
+            return False
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         height, width = rgb.shape[:2]
-        image = QImage(
+        self._image_buffer = rgb
+        self._image = QImage(
             rgb.data, width, height, 3 * width, QImage.Format.Format_RGB888
-        ).copy()
-        self._image = image
+        )
+        self._last_frame_index = frame_index
+        self._scaled_image = None
+        self._scaled_for = None
+        self._rendered_frames += 1
         self.update()
+        return True
+
+    def clear_frame(self) -> None:
+        self._image = None
+        self._image_buffer = None
+        self._last_frame_index = None
+        self._scaled_image = None
+        self.update()
+
+    def set_preview_enabled(self, enabled: bool) -> None:
+        self._preview_enabled = bool(enabled)
+        if not self._preview_enabled:
+            self.clear_frame()
+        else:
+            self._last_frame_index = None
+            self.update()
+
+    def rendered_frames(self) -> int:
+        return self._rendered_frames
+
+    def video_max_size(self) -> int:
+        """Longest displayed video dimension, so the pipeline can size once."""
+        rect = self.rect()
+        width, height = max(1, rect.width()), max(1, rect.height())
+        if width / height > 16 / 9:
+            return max(160, int(height * 16 / 9))
+        return max(160, width)
 
     def set_health(
         self,
@@ -93,13 +135,29 @@ class CameraTile(QFrame):
         *,
         started: bool = True,
     ) -> None:
+        changed = (
+            self._state,
+            round(fps, 1),
+            self._age,
+            self._reconnects,
+            self._started,
+            metrics.frame_index if metrics else None,
+        ) != (
+            state,
+            round(self._fps, 1),
+            self._age,
+            reconnects,
+            started,
+            self._metrics.frame_index if self._metrics else None,
+        )
         self._state = state
         self._fps = fps
         self._age = frame_age_s
         self._reconnects = reconnects
         self._metrics = metrics
         self._started = started
-        self.update()
+        if changed or not self._image:
+            self.update()
 
     def set_focused(self, focused: bool) -> None:
         self._focused = focused
@@ -129,18 +187,13 @@ class CameraTile(QFrame):
             self.clicked.emit(self.camera_id)
         super().mousePressEvent(event)
 
-    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 - Qt override
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.double_clicked.emit(self.camera_id)
-        super().mouseDoubleClickEvent(event)
-
     def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt override
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
             self.clicked.emit(self.camera_id)
             return
         super().keyPressEvent(event)
 
-    def _context_menu(self, position: QPoint) -> None:
+    def _make_context_menu(self) -> tuple[QMenu, object, object, object, object]:
         menu = QMenu(self)
         polygon = menu.addAction("Show polygon")
         polygon.setCheckable(True)
@@ -151,7 +204,10 @@ class CameraTile(QFrame):
         menu.addSeparator()
         snapshot = menu.addAction("Snapshot this tile…")
         flip = menu.addAction("Flip horizontally")
-        fullscreen = menu.addAction("Fullscreen")
+        return menu, polygon, line, snapshot, flip
+
+    def _context_menu(self, position: QPoint) -> None:
+        menu, polygon, line, snapshot, flip = self._make_context_menu()
         chosen = menu.exec(self.mapToGlobal(position))
         if chosen is None:
             return
@@ -169,8 +225,6 @@ class CameraTile(QFrame):
             self.snapshot_requested.emit(self.camera_id)
         elif chosen is flip:
             self.flip_requested.emit(self.camera_id)
-        elif chosen is fullscreen:
-            self.fullscreen_requested.emit(self.camera_id)
 
     # -- painting ----------------------------------------------------------
 
@@ -180,12 +234,20 @@ class CameraTile(QFrame):
         rect = self.rect()
         painter.fillRect(rect, QColor(self.theme.tokens["bg-field"]))
 
-        if self._image is not None:
-            scaled = self._image.scaled(
-                rect.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
+        if not self._preview_enabled:
+            self._paint_preview_off(painter, rect)
+        elif self._image is not None:
+            scaled = self._scaled_image
+            if scaled is None or self._scaled_for != rect.size():
+                # The pipeline already used INTER_AREA to the requested size;
+                # this is the only fallback scaling, once per frame or resize.
+                scaled = self._image.scaled(
+                    rect.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.FastTransformation,
+                )
+                self._scaled_image = scaled
+                self._scaled_for = rect.size()
             x = (rect.width() - scaled.width()) // 2
             y = (rect.height() - scaled.height()) // 2
             painter.drawImage(x, y, scaled)
@@ -194,7 +256,9 @@ class CameraTile(QFrame):
         else:
             painter.fillRect(rect, QColor(self.theme.tokens["bg-field"]))
 
-        if self.status_word() != "LIVE" or self._image is None:
+        if self._preview_enabled and (
+            self.status_word() != "LIVE" or self._image is None
+        ):
             self._paint_no_signal(painter, rect)
 
         self._paint_name_strip(painter, rect)
@@ -203,6 +267,9 @@ class CameraTile(QFrame):
             self._paint_telemetry(painter, rect)
 
         border = QColor(self.theme.tokens["border"])
+        # The badge set a translucent brush; without clearing it drawRect
+        # would flood the whole frame with the panel colour.
+        painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.setPen(QPen(border, 1))
         painter.drawRect(rect.adjusted(0, 0, -1, -1))
         if self._focused:
@@ -241,6 +308,14 @@ class CameraTile(QFrame):
         painter.drawRoundedRect(badge, 4, 4)
         painter.setPen(QColor(self.theme.tokens[tone or "text-secondary"]))
         painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, text)
+
+    def _paint_preview_off(self, painter: QPainter, rect: QRect) -> None:
+        font = QFont()
+        font.setPixelSize(13)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(QColor(self.theme.tokens["text-secondary"]))
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "PREVIEW OFF")
 
     def _paint_no_signal(self, painter: QPainter, rect: QRect) -> None:
         word = self.status_word()

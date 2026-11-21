@@ -78,8 +78,7 @@ def test_shell_builds_with_menus_tiles_and_chips(qt_app, tmp_path):
         assert window.windowTitle() == "Smarti AI Host — Traffic Control Console"
         assert set(window._tiles) == {"cam_main", "cam_sec_a", "cam_sec_b"}
         assert window.camera_chip.text.text() == "0/3 cameras"
-        assert window.dry_chip.isVisible()
-        assert window.mode_badge.text() == "SIMULATION"
+        assert window.mode_badge.text() == "SIMULATION:DRY-RUN"
         assert window.start_button.text() == "START"
         assert window.playback_section.isVisible()
     finally:
