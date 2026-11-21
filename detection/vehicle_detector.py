@@ -17,6 +17,24 @@ from ultralytics import YOLO
 _log = logging.getLogger(__name__)
 
 
+def configure_runtime_threads(torch_threads: int, cv_threads: int = 1) -> None:
+    """Cap BLAS/torch and OpenCV threads instead of oversubscribing every core."""
+    import cv2
+
+    cv2.setNumThreads(max(1, int(cv_threads)))
+    try:
+        import torch
+
+        torch.set_num_threads(max(1, int(torch_threads)))
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            # Already initialised; the process-wide value is left alone.
+            pass
+    except Exception:  # noqa: BLE001 - detection must still be usable
+        _log.warning("could not cap torch threads", exc_info=True)
+
+
 def auto_device() -> str:
     """Return ``cuda`` when a GPU is usable, otherwise ``cpu``."""
     try:

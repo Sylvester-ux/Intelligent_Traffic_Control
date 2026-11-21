@@ -38,6 +38,7 @@ class ApproachMetrics:
     frame_index: int = 0
     processing_fps: float = 0.0
     latency_s: float = 0.0
+    inference_s: float = 0.0
 
     def to_log_dict(self) -> dict:
         return {
@@ -55,6 +56,7 @@ class ApproachMetrics:
             "frame_index": self.frame_index,
             "processing_fps": self.processing_fps,
             "latency_s": self.latency_s,
+            "inference_s": self.inference_s,
         }
 
     def with_health(self, healthy: bool, frame_age_s: float) -> "ApproachMetrics":
@@ -73,6 +75,7 @@ class ApproachMetrics:
             frame_index=self.frame_index,
             processing_fps=self.processing_fps,
             latency_s=self.latency_s,
+            inference_s=self.inference_s,
         )
 
 

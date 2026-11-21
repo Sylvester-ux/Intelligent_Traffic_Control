@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
@@ -29,7 +30,7 @@ from app.decision_log import DecisionLog
 from camera.manager import CameraManager
 from decision.engine import Decision, DecisionEngine
 from decision.models import ApproachMetrics, Recommendation
-from detection.vehicle_detector import VehicleDetector
+from detection.vehicle_detector import VehicleDetector, configure_runtime_threads
 from gateway.adapter import ProtocolAdapter
 from gateway.client import GatewayClient, RequestResult
 from pipeline.camera_pipeline import CameraPipeline
@@ -62,23 +63,37 @@ class Orchestrator:
         self.on_tick = on_tick
 
         self.sources = {
-            camera.id: build_source(camera) for camera in config.cameras
+            camera.id: build_source(
+                camera,
+                analysis_max_width=config.performance.analysis_max_width,
+            )
+            for camera in config.cameras
         }
         self.manager = CameraManager(self.sources)
 
         factory = detector_factory or self._default_detector
-        self.pipelines: list[CameraPipeline] = [
-            CameraPipeline(
-                camera.id,
-                camera.approach,
-                self.sources[camera.id],
-                factory(camera),
-                camera.pipeline_config(),
-                annotate=self.display or annotate_frames,
-                draw_stats=draw_stats,
+        self.pipelines: list[CameraPipeline] = []
+        for camera in config.cameras:
+            pipeline_config = camera.pipeline_config()
+            pipeline_config = replace(
+                pipeline_config,
+                target_fps=min(
+                    camera.target_fps, config.performance.target_fps
+                ),
+                adaptive_fps=config.performance.adaptive_fps,
+                min_fps=config.performance.min_fps,
             )
-            for camera in config.cameras
-        ]
+            self.pipelines.append(
+                CameraPipeline(
+                    camera.id,
+                    camera.approach,
+                    self.sources[camera.id],
+                    factory(camera),
+                    pipeline_config,
+                    annotate=self.display or annotate_frames,
+                    draw_stats=draw_stats,
+                )
+            )
 
         self.engine = DecisionEngine(config.units, config.decision)
         self.adapter = ProtocolAdapter(
@@ -114,6 +129,10 @@ class Orchestrator:
     def start(self) -> None:
         if self._started:
             return
+        configure_runtime_threads(
+            self.config.performance.threads,
+            self.config.performance.cv_threads,
+        )
         self._stop.clear()
         self._last_tick_at = None
         self._gate_state = None
@@ -222,11 +241,15 @@ class Orchestrator:
                 pipeline.set_overlays(polygon=polygon, count_line=count_line)
                 return
 
-    def annotated_frame(self, camera_id: str, max_size: int = 640):
-        """Return a downscaled annotated copy, never the full-size buffer."""
+    def annotated_frame(
+        self, camera_id: str, max_size: int = 640, if_version: Optional[int] = None
+    ):
+        """Return a downscaled annotated frame, never the raw capture buffer."""
         for pipeline in self.pipelines:
             if pipeline.camera_id == camera_id:
-                return pipeline.latest_annotated(max_size=max_size)
+                return pipeline.latest_annotated(
+                    max_size=max_size, if_version=if_version
+                )
         return None
 
     def gate_reason(self) -> str:
@@ -529,5 +552,5 @@ class Orchestrator:
             detection.model,
             device=None if detection.device == "auto" else detection.device,
             confidence=detection.confidence,
-            imgsz=detection.imgsz,
+            imgsz=detection.imgsz or self.config.performance.imgsz,
         )

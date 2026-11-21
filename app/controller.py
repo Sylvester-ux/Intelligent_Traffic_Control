@@ -25,9 +25,10 @@ from app.events import EventFeed, LogBroadcaster, LogLine, UiEvent
 from app.exporters import (
     export_diagnostics,
     export_entries,
+    export_log_file,
     export_text,
-    filter_range,
     load_entries,
+    tail_entries,
 )
 from app.orchestrator import Orchestrator
 from app.snapshots import (
@@ -37,7 +38,7 @@ from app.snapshots import (
     UnitView,
     frozen_mapping,
 )
-from app.system_info import system_usage
+from app.system_info import process_usage, system_usage
 from camera.file_source import FileSource
 
 _log = logging.getLogger("app.controller")
@@ -252,8 +253,18 @@ class AppController:
 
     # -- read side ---------------------------------------------------------
 
-    def frame(self, camera_id: str, max_size: int = 640):
-        return self.orchestrator.annotated_frame(camera_id, max_size=max_size)
+    def frame(
+        self, camera_id: str, max_size: int = 640, *, if_version: int | None = None
+    ):
+        return self.orchestrator.annotated_frame(
+            camera_id, max_size=max_size, if_version=if_version
+        )
+
+    def frame_version(self, camera_id: str) -> int:
+        for pipeline in self.orchestrator.pipelines:
+            if pipeline.camera_id == camera_id:
+                return pipeline.annotated_version()
+        return 0
 
     def snapshot(self) -> UiSnapshot:
         orchestrator = self.orchestrator
@@ -269,6 +280,7 @@ class AppController:
             session_iso = self._session_started_iso
 
         sources = {camera.id: camera.source for camera in self.config.cameras}
+        pipelines = {pipeline.camera_id: pipeline for pipeline in orchestrator.pipelines}
         cameras = tuple(
             CameraView(
                 camera_id=camera_id,
@@ -285,6 +297,31 @@ class AppController:
                 fps=snapshot.fps,
                 frame_age_s=snapshot.last_frame_age_s,
                 reconnects=snapshot.reconnects,
+                processed_fps=(
+                    metrics[camera_id].processing_fps
+                    if camera_id in metrics
+                    else 0.0
+                ),
+                inference_ms=(
+                    round(metrics[camera_id].inference_s * 1000, 1)
+                    if camera_id in metrics
+                    else 0.0
+                ),
+                dropped_frames=(
+                    pipelines[camera_id].dropped_frames
+                    if camera_id in pipelines
+                    else 0
+                ),
+                effective_fps=(
+                    pipelines[camera_id].target_fps
+                    if camera_id in pipelines
+                    else 0.0
+                ),
+                overloaded=(
+                    pipelines[camera_id].overloaded
+                    if camera_id in pipelines
+                    else False
+                ),
             )
             for camera_id, snapshot in sorted(health.items())
         )
@@ -346,6 +383,7 @@ class AppController:
             gateway_state = "OFFLINE"
 
         cpu_percent, memory_percent = system_usage()
+        app_cpu_percent, app_memory_mb = process_usage()
         return UiSnapshot(
             mode=self.config.gateway_mode,
             dry_run=self.dry_run,
@@ -384,6 +422,12 @@ class AppController:
             tick_count=tick_count,
             last_tick_iso=entry.get("ts"),
             session_started_iso=session_iso,
+            file_sources=any(
+                camera.source == "file" for camera in self.config.cameras
+            ),
+            performance_profile=self.config.performance.label,
+            app_cpu_percent=app_cpu_percent,
+            app_memory_mb=app_memory_mb,
         )
 
     # -- exports -----------------------------------------------------------
@@ -407,12 +451,15 @@ class AppController:
                 ]
             return export_text(text_lines, path)
 
-        if selected is not None:
-            entries = [dict(entry) for entry in selected]
-        else:
-            entries = load_entries(self.config.logging.decision_log)
-        if range_key.lower() != "all" and selected is None:
-            entries = filter_range(entries, range_key)
+        if selected is None:
+            return export_log_file(
+                self.config.logging.decision_log,
+                path,
+                fmt,
+                range_key,
+                progress=progress,
+            )
+        entries = [dict(entry) for entry in selected]
         return export_entries(entries, path, fmt, progress=progress)
 
     def export_diagnostics(
@@ -422,7 +469,7 @@ class AppController:
         versions: Optional[Mapping[str, str]] = None,
         progress: Optional[Callable[[int, int], None]] = None,
     ) -> Path:
-        entries = load_entries(self.config.logging.decision_log)
+        entries = tail_entries(self.config.logging.decision_log, limit=500)
         lines, _ = self._logs.drain(0)
         health = {
             camera_id: {

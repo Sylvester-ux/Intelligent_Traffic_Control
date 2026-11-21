@@ -14,9 +14,10 @@ import platform
 import re
 import sys
 import zipfile
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Sequence
 
 import yaml
 
@@ -94,30 +95,161 @@ def log_paths(path: str | Path, *, include_rotated: bool = True) -> list[Path]:
     return paths
 
 
-def load_entries(
+def iter_entries(
     path: str | Path, *, include_rotated: bool = True
-) -> list[dict[str, Any]]:
-    """Read every parseable JSONL decision record, oldest file first."""
-    entries: list[dict[str, Any]] = []
+) -> Iterator[dict[str, Any]]:
+    """Stream parseable JSONL decision records without loading the file."""
     for item in log_paths(path, include_rotated=include_rotated):
         if not item.is_file():
             continue
         try:
-            text = item.read_text(encoding="utf-8")
+            handle = item.open("r", encoding="utf-8")
         except OSError:
             continue
-        for line in text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, dict):
-                entries.append(value)
+        with handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(value, dict):
+                    yield value
+
+
+def load_entries(
+    path: str | Path, *, include_rotated: bool = True
+) -> list[dict[str, Any]]:
+    """Read every parseable JSONL decision record, oldest first."""
+    entries = list(iter_entries(path, include_rotated=include_rotated))
     entries.sort(key=lambda entry: str(entry.get("ts", "")))
     return entries
+
+
+def tail_entries(path: str | Path, *, limit: int = 500) -> list[dict[str, Any]]:
+    """Keep only the newest ``limit`` records in memory (constant otherwise)."""
+    kept: deque[dict[str, Any]] = deque(maxlen=max(1, int(limit)))
+    for entry in iter_entries(path):
+        kept.append(entry)
+    entries = list(kept)
+    entries.sort(key=lambda entry: str(entry.get("ts", "")))
+    return entries
+
+
+def _range_cutoff(range_key: str) -> Optional[datetime]:
+    key = range_key.strip().lower()
+    if key in ("5 min", "last 5 min", "last-5-min"):
+        key = "5m"
+    if key in ("1 hour", "last hour", "last-hour"):
+        key = "1h"
+    if key not in RANGE_SECONDS:
+        raise ValueError(f"unknown export range {range_key!r}")
+    seconds = RANGE_SECONDS[key]
+    return None if seconds is None else datetime.now(timezone.utc) - timedelta(
+        seconds=seconds
+    )
+
+
+def _in_range(entry: Mapping[str, Any], cutoff: Optional[datetime]) -> bool:
+    if cutoff is None:
+        return True
+    stamp = entry.get("ts")
+    if not isinstance(stamp, str):
+        return False
+    try:
+        parsed = datetime.fromisoformat(stamp)
+    except ValueError:
+        return False
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed >= cutoff
+
+
+def _line_count(path: str | Path) -> int:
+    total = 0
+    for item in log_paths(path):
+        if not item.is_file():
+            continue
+        try:
+            with item.open("rb") as handle:
+                total += sum(1 for line in handle if line.strip())
+        except OSError:
+            continue
+    return total
+
+
+def export_log_file(
+    source: str | Path,
+    target: str | Path,
+    fmt: str,
+    range_key: str = "all",
+    *,
+    progress: Optional[Progress] = None,
+) -> int:
+    """Stream a decision-log export, one record at a time.
+
+    JSONL needs one pass. CSV makes a metadata pass for the dynamic approach
+    and unit columns, then writes the data pass. Neither holds the log in RAM.
+    """
+    kind = fmt.lower()
+    if kind not in ("jsonl", "json", "csv"):
+        raise ValueError(f"unknown export format {fmt!r}")
+    cutoff = _range_cutoff(range_key)
+    total = _line_count(source)
+    output = Path(target)
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    if kind in ("jsonl", "json"):
+        count = 0
+        with output.open("w", encoding="utf-8", newline="\n") as handle:
+            for entry in iter_entries(source):
+                if not _in_range(entry, cutoff):
+                    continue
+                handle.write(
+                    json.dumps(entry, separators=(",", ":"), ensure_ascii=False)
+                    + "\n"
+                )
+                count += 1
+                if progress is not None and count % 200 == 0:
+                    progress(count, total)
+        if progress is not None:
+            progress(total, total)
+        return count
+
+    base_fields = [
+        "timestamp",
+        "mode",
+        "gate_open",
+        "unit",
+        "wire_movement",
+        "green_time",
+        "request_sent",
+        "request_status",
+        "accepted",
+        "latency_s",
+    ]
+    extras: set[str] = set()
+    for entry in iter_entries(source):
+        if not _in_range(entry, cutoff):
+            continue
+        extras.update(key for key in _flatten(entry) if key not in base_fields)
+    fieldnames = base_fields + sorted(extras)
+    count = 0
+    with output.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for entry in iter_entries(source):
+            if not _in_range(entry, cutoff):
+                continue
+            writer.writerow(_flatten(entry))
+            count += 1
+            if progress is not None and count % 200 == 0:
+                progress(count, total)
+    if progress is not None:
+        progress(total, total)
+    return count
 
 
 def filter_range(

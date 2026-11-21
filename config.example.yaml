@@ -135,7 +135,21 @@ detection:
   model: yolo11n.pt
   device: auto           # auto|cuda|cpu
   confidence: 0.3
-  # imgsz: 640
+  # imgsz: 640             # overrides performance.imgsz
+
+# Inference budget. auto = low on CPU-only machines with <= 8 GB RAM,
+# otherwise balanced. Explicit values override the preset. Load shedding can
+# step target_fps down to min_fps but never changes a health threshold.
+performance:
+  profile: auto           # auto|low|balanced|high
+  # target_fps: 3         # low=3, balanced=5, high=8
+  # imgsz: 480            # low=480, balanced/high=640
+  # preview_fps: 5        # low=5, balanced=8, high=10
+  # preview_scale: 0.5    # low=0.5, balanced=0.75, high=1.0
+  # threads: 1            # torch threads per pipeline process
+  # cv_threads: 1
+  adaptive_fps: true
+  min_fps: 2
 
 logging:
   level: INFO

@@ -53,6 +53,8 @@ class PipelineConfig:
     congestion_high_threshold: float = 8.0
     congestion_stationary_threshold: float = 0.5
     congestion_moderate_stationary_ratio: float = 0.3
+    adaptive_fps: bool = True
+    min_fps: float = 2.0
 
 
 class CameraPipeline:
@@ -98,13 +100,19 @@ class CameraPipeline:
         self._lock = threading.Lock()
         self._metrics: Optional[ApproachMetrics] = None
         self._annotated: Optional[np.ndarray] = None
+        self._annotated_index = 0
         self._last_frame_index = -1
+        self._last_source_index = -1
+        self._dropped_frames = 0
         self._last_process_at: Optional[float] = None
         self._last_publish_at = 0.0
         self._process_times: list[float] = []
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._period = 1.0 / max(0.1, self.config.target_fps)
+        self._target_fps = max(0.1, self.config.target_fps)
+        self._period = 1.0 / self._target_fps
+        self._slow_streak = 0
+        self._overloaded = False
         self._show_polygon = True
         self._show_count_line = True
         self._reset_requested = threading.Event()
@@ -142,7 +150,12 @@ class CameraPipeline:
     def process_frame(self, frame: Frame) -> ApproachMetrics:
         """Process one explicit frame and store the resulting metrics."""
         started = time.monotonic()
+        if self._last_source_index >= 0 and frame.index > self._last_source_index + 1:
+            self._dropped_frames += frame.index - self._last_source_index - 1
+        self._last_source_index = max(self._last_source_index, frame.index)
+        inference_started = time.monotonic()
         results = self.detector.detect(frame.image)
+        inference_s = time.monotonic() - inference_started
         objects = self.tracker.update(results, self.detector.names, now=started)
         expired = self.tracker.prune(started)
         if expired:
@@ -190,6 +203,7 @@ class CameraPipeline:
             frame_index=frame.index,
             processing_fps=self._fps(),
             latency_s=round(finished - started, 3),
+            inference_s=round(inference_s, 3),
         )
 
         annotated = None
@@ -199,10 +213,41 @@ class CameraPipeline:
         with self._lock:
             self._metrics = metrics
             self._annotated = annotated
+            self._annotated_index = frame.index
             self._last_process_at = finished
             self._last_publish_at = finished
 
+        self._adapt_load(finished - started, inference_s)
         return metrics
+
+    def _adapt_load(self, elapsed_s: float, inference_s: float) -> None:
+        """Drop the target fps when inference persistently exceeds its budget.
+
+        Health thresholds are untouched: this only reduces work so frames stay
+        fresh. Recovery is deliberately not automatic, avoiding oscillation.
+        """
+        if not self.config.adaptive_fps:
+            return
+        over_budget = inference_s > self._period * 1.15 or elapsed_s > self._period * 1.5
+        if not over_budget:
+            self._slow_streak = 0
+            return
+        self._slow_streak += 1
+        if self._slow_streak < 5 or self._target_fps <= self.config.min_fps:
+            return
+        old = self._target_fps
+        self._target_fps = max(self.config.min_fps, self._target_fps - 1.0)
+        self._period = 1.0 / self._target_fps
+        self._overloaded = True
+        self._slow_streak = 0
+        _log.warning(
+            "pipeline %s overloaded: reduced from %.0f to %.0f fps "
+            "(inference %.0f ms)",
+            self.camera_id,
+            old,
+            self._target_fps,
+            inference_s * 1000,
+        )
 
     def latest_metrics(self) -> ApproachMetrics:
         """Latest snapshot with freshness/health recomputed right now."""
@@ -236,10 +281,20 @@ class CameraPipeline:
 
         return base.with_health(healthy, age if age is not None else 0.0)
 
-    def latest_annotated(self, max_size: Optional[int] = None) -> Optional[np.ndarray]:
-        """Copy the annotated frame, optionally downscaled for a GUI tile."""
+    def latest_annotated(
+        self, max_size: Optional[int] = None, *, if_version: Optional[int] = None
+    ) -> Optional[np.ndarray]:
+        """Return the current annotated frame, downscaled once for a GUI tile.
+
+        The array is not mutated after publication, so returning the reference
+        avoids a full-frame copy. ``if_version`` lets a poller skip conversion
+        until a genuinely new frame has been processed.
+        """
         with self._lock:
-            frame = None if self._annotated is None else self._annotated.copy()
+            frame = self._annotated
+            version = self._annotated_index
+        if if_version is not None and version <= if_version:
+            return None
         if frame is None or max_size is None:
             return frame
         height, width = frame.shape[:2]
@@ -249,6 +304,22 @@ class CameraPipeline:
         scale = max_size / longest
         target = (max(1, int(width * scale)), max(1, int(height * scale)))
         return cv2.resize(frame, target, interpolation=cv2.INTER_AREA)
+
+    def annotated_version(self) -> int:
+        with self._lock:
+            return self._annotated_index
+
+    @property
+    def target_fps(self) -> float:
+        return self._target_fps
+
+    @property
+    def overloaded(self) -> bool:
+        return self._overloaded
+
+    @property
+    def dropped_frames(self) -> int:
+        return self._dropped_frames
 
     def set_overlays(self, *, polygon: bool = True, count_line: bool = True) -> None:
         """Toggle the vector overlays drawn into the annotated copy."""
@@ -282,9 +353,15 @@ class CameraPipeline:
         with self._lock:
             self._metrics = None
             self._annotated = None
+            self._annotated_index = 0
             self._last_frame_index = -1
+            self._last_source_index = -1
             self._last_process_at = None
             self._process_times.clear()
+        self._target_fps = max(0.1, self.config.target_fps)
+        self._period = 1.0 / self._target_fps
+        self._slow_streak = 0
+        self._overloaded = False
         _log.info("pipeline %s analysis state reset", self.camera_id)
 
     # -- worker -----------------------------------------------------------
