@@ -14,6 +14,7 @@ from typing import Any, Mapping, Optional
 
 import yaml
 
+from app.system_info import total_memory_gb
 from camera.base import FrameSource
 from camera.file_source import FileSource
 from camera.rtsp import RtspSource
@@ -34,6 +35,31 @@ _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 class ConfigError(ValueError):
     """Raised for malformed or inconsistent configuration."""
+
+
+PERFORMANCE_PRESETS: dict[str, dict[str, float | int]] = {
+    "low": {
+        "target_fps": 3.0,
+        "imgsz": 480,
+        "preview_fps": 5.0,
+        "preview_scale": 0.5,
+        "threads": 1,
+    },
+    "balanced": {
+        "target_fps": 5.0,
+        "imgsz": 640,
+        "preview_fps": 8.0,
+        "preview_scale": 0.75,
+        "threads": 1,
+    },
+    "high": {
+        "target_fps": 8.0,
+        "imgsz": 640,
+        "preview_fps": 10.0,
+        "preview_scale": 1.0,
+        "threads": 2,
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -78,6 +104,35 @@ class DetectionConfig:
 
 
 @dataclass(frozen=True)
+class PerformanceConfig:
+    """Resolved inference and preview budget.
+
+    ``requested_profile`` keeps the config value (including ``auto``) for the
+    UI; ``profile`` is the preset actually applied.
+    """
+
+    profile: str = "low"
+    requested_profile: str = "auto"
+    target_fps: float = 3.0
+    imgsz: int = 480
+    preview_fps: float = 5.0
+    preview_scale: float = 0.5
+    threads: int = 1
+    cv_threads: int = 1
+    adaptive_fps: bool = True
+    min_fps: float = 2.0
+    analysis_max_width: int = 960
+
+    @property
+    def label(self) -> str:
+        return (
+            self.profile
+            if self.requested_profile == self.profile
+            else f"{self.profile} (auto)"
+        )
+
+
+@dataclass(frozen=True)
 class HealthConfig:
     max_frame_age_s: float = 2.0
     tick_interval_s: float = 1.0
@@ -102,6 +157,7 @@ class AppConfig:
     health: HealthConfig
     logging: LoggingConfig
     detection: DetectionConfig = field(default_factory=DetectionConfig)
+    performance: PerformanceConfig = field(default_factory=PerformanceConfig)
     display: bool = False
     gateway_mode: str = COMPAT_MODE
     gateway_movements: dict[str, str] = field(default_factory=dict)
@@ -199,6 +255,7 @@ def build_config(raw: Mapping[str, Any], *, base_dir: Optional[Path] = None) -> 
 
     detection_raw = raw.get("detection") or {}
     detection = _build(DetectionConfig, detection_raw, "detection")
+    performance = _performance(raw.get("performance"))
 
     display = bool(raw.get("display", False))
 
@@ -210,6 +267,7 @@ def build_config(raw: Mapping[str, Any], *, base_dir: Optional[Path] = None) -> 
         health=health,
         logging=logging_config,
         detection=detection,
+        performance=performance,
         display=display,
         gateway_mode=gateway_mode,
         gateway_movements=gateway_movements,
@@ -559,6 +617,87 @@ def _decision_settings(
         raise ConfigError(f"invalid decision settings: {exc}") from exc
 
 
+def _performance(raw: Any) -> PerformanceConfig:
+    """Resolve the preset and apply explicit performance overrides."""
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, Mapping):
+        raise ConfigError("'performance' must be a mapping")
+    allowed = {
+        "profile",
+        "target_fps",
+        "imgsz",
+        "preview_fps",
+        "preview_scale",
+        "threads",
+        "cv_threads",
+        "adaptive_fps",
+        "min_fps",
+    }
+    unknown = set(raw) - allowed
+    if unknown:
+        raise ConfigError(f"unknown keys in 'performance': {sorted(unknown)}")
+
+    requested = str(raw.get("profile", "auto")).lower()
+    if requested not in ("auto", "low", "balanced", "high"):
+        raise ConfigError(
+            "performance.profile must be auto, low, balanced or high, "
+            f"got {requested!r}"
+        )
+    resolved = requested
+    if resolved == "auto":
+        memory = total_memory_gb()
+        resolved = "low" if memory is None or memory <= 8.5 else "balanced"
+
+    values: dict[str, Any] = dict(PERFORMANCE_PRESETS[resolved])
+    for key in (
+        "target_fps",
+        "imgsz",
+        "preview_fps",
+        "preview_scale",
+        "threads",
+        "cv_threads",
+        "adaptive_fps",
+        "min_fps",
+    ):
+        if key in raw:
+            values[key] = raw[key]
+
+    target_fps = float(values["target_fps"])
+    min_fps = float(values.get("min_fps", 2.0))
+    imgsz = int(values["imgsz"])
+    preview_fps = float(values["preview_fps"])
+    preview_scale = float(values["preview_scale"])
+    threads = int(values.get("threads", 1))
+    cv_threads = int(values.get("cv_threads", 1))
+    if target_fps <= 0:
+        raise ConfigError("performance.target_fps must be positive")
+    if not 1.0 <= min_fps <= target_fps:
+        raise ConfigError("performance.min_fps must be within [1, target_fps]")
+    if not 320 <= imgsz <= 1280:
+        raise ConfigError("performance.imgsz must be within [320, 1280]")
+    if not 1 <= preview_fps <= 30:
+        raise ConfigError("performance.preview_fps must be within [1, 30]")
+    if not 0.25 <= preview_scale <= 1.0:
+        raise ConfigError("performance.preview_scale must be within [0.25, 1.0]")
+    if threads < 1 or cv_threads < 1:
+        raise ConfigError("performance thread counts must be at least 1")
+
+    return PerformanceConfig(
+        profile=resolved,
+        requested_profile=requested,
+        target_fps=target_fps,
+        imgsz=imgsz,
+        preview_fps=preview_fps,
+        preview_scale=preview_scale,
+        threads=threads,
+        cv_threads=cv_threads,
+        adaptive_fps=bool(values.get("adaptive_fps", True)),
+        min_fps=min_fps,
+        analysis_max_width=max(640, imgsz * 2),
+    )
+
+
 def _build(cls, data: Mapping[str, Any], section: str):
     if not isinstance(data, Mapping):
         raise ConfigError(f"'{section}' must be a mapping")
@@ -599,7 +738,9 @@ def _expand_env(value: Any, env: Mapping[str, str]) -> Any:
 # -- runtime construction -------------------------------------------------
 
 
-def build_source(camera: CameraConfig) -> FrameSource:
+def build_source(
+    camera: CameraConfig, *, analysis_max_width: Optional[int] = None
+) -> FrameSource:
     """Create the frame source described by a camera config."""
     if camera.source == "rtsp":
         return RtspSource(
@@ -609,6 +750,7 @@ def build_source(camera: CameraConfig) -> FrameSource:
             width=camera.width,
             height=camera.height,
             stale_after_s=camera.stale_after_s,
+            max_width=analysis_max_width,
         )
     if camera.source == "webcam":
         return WebcamSource(
@@ -618,6 +760,7 @@ def build_source(camera: CameraConfig) -> FrameSource:
             width=camera.width,
             height=camera.height,
             stale_after_s=camera.stale_after_s,
+            max_width=analysis_max_width,
         )
     if camera.source == "file":
         return FileSource(
@@ -627,5 +770,6 @@ def build_source(camera: CameraConfig) -> FrameSource:
             realtime=camera.realtime,
             flip=camera.flip,
             stale_after_s=camera.stale_after_s,
+            max_width=analysis_max_width,
         )
     raise ConfigError(f"unsupported camera source {camera.source!r}")

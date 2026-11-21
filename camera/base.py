@@ -169,11 +169,14 @@ class ThreadedFrameSource(FrameSource):
         reconnect_min_s: float = 1.0,
         reconnect_max_s: float = 10.0,
         flip: bool = False,
+        max_width: Optional[int] = None,
     ) -> None:
         super().__init__(camera_id=camera_id, stale_after_s=stale_after_s)
         self.reconnect_min_s = reconnect_min_s
         self.reconnect_max_s = reconnect_max_s
         self.flip = flip
+        # Downscale once here, before a full-resolution frame is retained.
+        self.max_width = None if max_width is None else max(160, int(max_width))
         self._log = logging.getLogger(f"camera.{camera_id}")
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -251,6 +254,16 @@ class ThreadedFrameSource(FrameSource):
                 continue
             if self.flip:
                 image = cv2.flip(image, 1)
+            if self.max_width is not None and image.shape[1] > self.max_width:
+                scale = self.max_width / image.shape[1]
+                image = cv2.resize(
+                    image,
+                    (
+                        self.max_width,
+                        max(1, int(round(image.shape[0] * scale))),
+                    ),
+                    interpolation=cv2.INTER_AREA,
+                )
             self._publish(image)
             self._ever_framed = True
             self._backoff_s = self.reconnect_min_s

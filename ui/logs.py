@@ -50,11 +50,12 @@ class LiveLogTab(QWidget):
         self._levels = {"INFO", "WARN", "ERROR"}
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(4)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(2)
 
         controls = QHBoxLayout()
-        controls.setSpacing(6)
+        controls.setSpacing(4)
+        controls.setContentsMargins(0, 0, 0, 0)
         self.filter_boxes: dict[str, QCheckBox] = {}
         for key in ("INFO", "WARN", "ERROR"):
             box = QCheckBox(key)
@@ -68,13 +69,17 @@ class LiveLogTab(QWidget):
         self.search.setPlaceholderText("Search message or logger")
         self.search.textChanged.connect(self._render)
         controls.addWidget(self.search, 1)
+        self.search.setFixedHeight(26)
         self.pause_scroll = QPushButton("Pause scroll")
         self.pause_scroll.setCheckable(True)
+        self.pause_scroll.setProperty("compact", True)
         controls.addWidget(self.pause_scroll)
         copy = QPushButton("Copy")
+        copy.setProperty("compact", True)
         copy.clicked.connect(self._copy)
         controls.addWidget(copy)
-        jump = QPushButton("Jump to latest")
+        jump = QPushButton("Jump")
+        jump.setProperty("compact", True)
         jump.clicked.connect(self._jump)
         controls.addWidget(jump)
         layout.addLayout(controls)
@@ -188,8 +193,8 @@ class DecisionsTab(QWidget):
         self._signature: tuple | None = None
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(4)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(2)
         self.table = QTableWidget(0, len(self.HEADERS))
         self.table.setAccessibleName("Decision records")
         self.table.setHorizontalHeaderLabels(self.HEADERS)
@@ -198,12 +203,13 @@ class DecisionsTab(QWidget):
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.verticalHeader().setDefaultSectionSize(22)
         self.table.currentCellChanged.connect(self._show_selected)
         layout.addWidget(self.table, 1)
 
         self.detail = QPlainTextEdit()
         self.detail.setReadOnly(True)
-        self.detail.setMaximumHeight(150)
+        self.detail.setMaximumHeight(72)
         self.detail.setPlaceholderText("Select a decision to see its full record.")
         layout.addWidget(self.detail)
 

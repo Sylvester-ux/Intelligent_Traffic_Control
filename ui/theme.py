@@ -107,44 +107,29 @@ QWidget {
     font-size: 13px;
 }
 QMainWindow, QDialog { background-color: {{bg-base}}; }
-QFrame#titleBar {
-    background-color: {{bg-chrome}};
-    border-bottom: 1px solid {{border}};
-}
-QLabel#appIcon {
-    background-color: {{accent}};
-    color: {{white}};
-    border-radius: 6px;
-    padding: 2px 7px;
-    font-weight: 700;
-}
-QLabel#appTitle {
-    color: {{text-primary}};
-    font-size: 15px;
-    font-weight: 600;
-    letter-spacing: 1px;
-}
 QLabel#modeBadge {
     background-color: {{badge-bg}};
     color: {{badge-text}};
     border-radius: 4px;
-    padding: 4px 10px;
+    padding: 3px 9px;
     font-size: 11px;
     font-weight: 700;
 }
-QLabel#banner {
-    background-color: {{banner-bg}};
+QLabel#modeBadge[tone="simulation"] {
+    background-color: {{status-warn}};
     color: {{banner-text}};
-    padding: 6px 12px;
-    font-weight: 600;
+}
+QLabel#modeBadge[tone="live"] {
+    background-color: {{status-ok}};
+    color: {{bg-field}};
 }
 QMenuBar {
     background-color: {{bg-chrome}};
     color: {{text-secondary}};
-    padding: 2px 6px;
+    padding: 0 4px;
     border-bottom: 1px solid {{border}};
 }
-QMenuBar::item { padding: 6px 10px; background: transparent; }
+QMenuBar::item { padding: 3px 8px; background: transparent; }
 QMenuBar::item:selected { background: {{bg-panel-raised}}; color: {{text-primary}}; }
 QMenu {
     background-color: {{bg-panel}};
@@ -157,6 +142,7 @@ QMenu::item:selected { background: {{selection}}; color: {{accent-text}}; }
 QMenu::separator { height: 1px; background: {{border}}; margin: 4px 8px; }
 QStatusBar { background-color: {{bg-base}}; border-top: 1px solid {{border}}; }
 QStatusBar::item { border: none; }
+QStatusBar QPushButton, QStatusBar .QPushButton { min-height: 26px; max-height: 26px; }
 QLabel#session {
     font-family: {{mono-font}};
     color: {{text-secondary}};
@@ -197,6 +183,7 @@ QPushButton {
     padding: 0 14px;
 }
 QPushButton:hover { border-color: {{accent-text}}; }
+QPushButton[compact="true"] { min-height: 24px; padding: 0 8px; }
 QPushButton:pressed { background-color: {{selection}}; }
 QPushButton:disabled { color: {{text-muted}}; border-color: {{border}}; }
 QPushButton:focus { border: 2px solid {{focus-ring}}; }
@@ -299,7 +286,7 @@ QTabWidget::pane { border: 1px solid {{border}}; background: {{bg-base}}; }
 QTabBar::tab {
     background: {{bg-chrome}};
     color: {{text-secondary}};
-    padding: 7px 16px;
+    padding: 4px 10px;
     border: 1px solid {{border}};
     border-bottom: none;
 }

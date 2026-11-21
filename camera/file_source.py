@@ -33,6 +33,7 @@ class FileSource(ThreadedFrameSource):
         stale_after_s: float = 2.0,
         reconnect_min_s: float = 1.0,
         reconnect_max_s: float = 10.0,
+        max_width: int | None = None,
     ) -> None:
         super().__init__(
             camera_id,
@@ -40,6 +41,7 @@ class FileSource(ThreadedFrameSource):
             reconnect_min_s=reconnect_min_s,
             reconnect_max_s=reconnect_max_s,
             flip=flip,
+            max_width=max_width,
         )
         self.path = Path(path)
         self.loop = loop

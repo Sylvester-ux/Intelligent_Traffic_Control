@@ -23,6 +23,11 @@ class CameraView:
     fps: float
     frame_age_s: Optional[float]
     reconnects: int
+    processed_fps: float = 0.0
+    inference_ms: float = 0.0
+    dropped_frames: int = 0
+    effective_fps: float = 0.0
+    overloaded: bool = False
 
 
 @dataclass(frozen=True)
@@ -79,6 +84,10 @@ class UiSnapshot:
     tick_count: int = 0
     last_tick_iso: Optional[str] = None
     session_started_iso: Optional[str] = None
+    file_sources: bool = False
+    performance_profile: str = "low"
+    app_cpu_percent: Optional[float] = None
+    app_memory_mb: Optional[float] = None
 
     @property
     def fresh_cameras(self) -> int:
